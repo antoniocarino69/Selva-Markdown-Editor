@@ -378,11 +378,6 @@ impl eframe::App for NotesApp {
                         CommonMarkViewer::new("viewer")
                             .show(ui, &mut self.commonmark_cache, &processed_text);
                     });
-                }).response.context_menu(|ui| {
-                    if ui.button("📋 Copy").clicked() {
-                        self.pending_editor_action = Some(EditorAction::Copy);
-                        ui.close_menu();
-                    }
                 });
         }
 
@@ -396,19 +391,10 @@ impl eframe::App for NotesApp {
 
                 if is_markdown && self.display_mode == DisplayMode::ViewOnly {
                     // Full screen preview
-                    let output = egui::ScrollArea::vertical().show(ui, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
                         CommonMarkViewer::new("central_viewer")
                             .show(ui, &mut self.commonmark_cache, &processed_text);
                     });
-                    
-                    // To add context menu to the whole View area
-                    ui.interact(output.inner_rect, ui.id().with("view_ctx"), egui::Sense::click())
-                        .context_menu(|ui| {
-                            if ui.button("📋 Copy").clicked() {
-                                self.pending_editor_action = Some(EditorAction::Copy);
-                                ui.close_menu();
-                            }
-                        });
                 } else {
                     // Editor
                     let previous_text_len = self.editor_text.chars().count();
