@@ -1,0 +1,15 @@
+[package]
+name = "markdown_notes"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = "0.27"
+egui = "0.27"
+egui_extras = { version = "0.27", features = ["all_loaders"] }
+egui_commonmark = "0.16"
+syntect = "5.2"
+walkdir = "2.5"
+open = "5.1"
+log = "0.4"
+env_logger = "0.11"
