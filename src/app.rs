@@ -17,6 +17,13 @@ enum FileAction {
     CreateNote(PathBuf),
 }
 
+#[derive(PartialEq)]
+enum EditorAction {
+    Cut,
+    Copy,
+    Paste,
+}
+
 pub struct NotesApp {
     workspace_dir: PathBuf,
     current_file_path: Option<PathBuf>,
@@ -29,6 +36,7 @@ pub struct NotesApp {
     force_expand_collapse: Option<bool>,
     create_note_target_dir: Option<PathBuf>,
     image_cache: std::collections::HashMap<String, PathBuf>,
+    pending_editor_action: Option<EditorAction>,
 }
 
 struct FileNode {
@@ -111,6 +119,7 @@ impl NotesApp {
             force_expand_collapse: None,
             create_note_target_dir: None,
             image_cache,
+            pending_editor_action: None,
         }
     }
 
@@ -216,6 +225,22 @@ impl eframe::App for NotesApp {
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let mut action = FileAction::None;
+        let mut is_paste_action = false;
+
+        if let Some(editor_act) = self.pending_editor_action.take() {
+            match editor_act {
+                EditorAction::Cut => ctx.input_mut(|i| i.events.push(egui::Event::Cut)),
+                EditorAction::Copy => ctx.input_mut(|i| i.events.push(egui::Event::Copy)),
+                EditorAction::Paste => {
+                    is_paste_action = true;
+                    if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                        if let Ok(text) = clipboard.get_text() {
+                            ctx.input_mut(|i| i.events.push(egui::Event::Paste(text)));
+                        }
+                    }
+                }
+            }
+        }
 
         egui::SidePanel::left("file_explorer_panel")
             .resizable(true)
@@ -330,7 +355,7 @@ impl eframe::App for NotesApp {
                 let img_name = &caps[1];
                 let filename = img_name.split('|').next().unwrap_or(img_name);
                 if let Some(path) = self.image_cache.get(filename) {
-                    format!("![{}]({}://{})", filename, "file", path.to_string_lossy().replace('\\', "/"))
+                    format!("![{}](<{}://{}>)", filename, "file", path.to_string_lossy().replace('\\', "/"))
                 } else {
                     format!("![[{}]]", img_name)
                 }
@@ -381,8 +406,24 @@ impl eframe::App for NotesApp {
                                 .show(ui)
                         }).inner;
 
+                    output.response.context_menu(|ui| {
+                        if ui.button("✂ Cut").clicked() {
+                            self.pending_editor_action = Some(EditorAction::Cut);
+                            ui.close_menu();
+                        }
+                        if ui.button("📋 Copy").clicked() {
+                            self.pending_editor_action = Some(EditorAction::Copy);
+                            ui.close_menu();
+                        }
+                        if ui.button("📝 Paste").clicked() {
+                            self.pending_editor_action = Some(EditorAction::Paste);
+                            ui.close_menu();
+                        }
+                    });
+
                     let mut pasted_image = false;
-                    if output.response.has_focus() && ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::V)) {
+                    let is_ctrl_v = ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::V));
+                    if (output.response.has_focus() && is_ctrl_v) || is_paste_action {
                         if let Ok(mut clipboard) = arboard::Clipboard::new() {
                             if let Ok(img_data) = clipboard.get_image() {
                                 let target_dir = self.workspace_dir.join("_assets");
