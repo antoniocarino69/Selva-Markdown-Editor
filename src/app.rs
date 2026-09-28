@@ -70,6 +70,10 @@ impl NotesApp {
     }
 
     fn open_file(&mut self, path: &Path) {
+        if let Some(parent) = path.parent() {
+            let _ = std::env::set_current_dir(parent);
+        }
+
         if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
             let ext = ext.to_lowercase();
             match ext.as_str() {
@@ -141,28 +145,37 @@ impl eframe::App for NotesApp {
             .resizable(true)
             .default_width(200.0)
             .show(ctx, |ui| {
-                ui.heading("Explorer");
-                
                 ui.horizontal(|ui| {
-                    if ui.button("📂 Open Folder").clicked() {
-                        if let Some(folder) = rfd::FileDialog::new().pick_folder() {
-                            self.workspace_dir = folder.clone();
-                            self.file_tree = FileNode::new(folder);
-                            self.current_file_path = None;
-                            self.editor_text = String::new();
+                    ui.heading("Explorer");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("🔄").on_hover_text("Refresh").clicked() {
+                            self.file_tree = FileNode::new(self.workspace_dir.clone());
                         }
-                    }
+                        if ui.button("➕").on_hover_text("New Note").clicked() {
+                            self.is_creating_note = true;
+                            self.new_note_name = String::from("Untitled.md");
+                        }
+                        if ui.button("📂").on_hover_text("Open Folder").clicked() {
+                            if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+                                self.workspace_dir = folder.clone();
+                                self.file_tree = FileNode::new(folder);
+                                self.current_file_path = None;
+                                self.editor_text = String::new();
+                            }
+                        }
+                    });
                 });
                 
+                ui.separator();
+
                 ui.horizontal(|ui| {
-                    if ui.button("➕ New Note").clicked() {
-                        self.is_creating_note = true;
-                        self.new_note_name = String::from("Untitled.md");
-                    }
-                    if ui.button("🔄 Refresh").clicked() {
-                        self.file_tree = FileNode::new(self.workspace_dir.clone());
-                    }
+                    ui.label("Mode:");
+                    ui.selectable_value(&mut self.display_mode, DisplayMode::ViewOnly, "👁 View");
+                    ui.selectable_value(&mut self.display_mode, DisplayMode::EditAndPreview, "📖 Split");
+                    ui.selectable_value(&mut self.display_mode, DisplayMode::EditOnly, "✏ Edit");
                 });
+                
+                ui.separator();
 
                 if self.is_creating_note {
                     ui.horizontal(|ui| {
@@ -228,17 +241,7 @@ impl eframe::App for NotesApp {
             if let Some(path) = &self.current_file_path {
                 let name = path.file_name().unwrap_or_default().to_string_lossy();
                 
-                ui.horizontal(|ui| {
-                    ui.heading(name);
-                    if is_markdown {
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.selectable_value(&mut self.display_mode, DisplayMode::ViewOnly, "👁 View");
-                            ui.selectable_value(&mut self.display_mode, DisplayMode::EditAndPreview, "📖 Split");
-                            ui.selectable_value(&mut self.display_mode, DisplayMode::EditOnly, "✏ Edit");
-                        });
-                    }
-                });
-                
+                ui.heading(name);
                 ui.separator();
 
                 if is_markdown && self.display_mode == DisplayMode::ViewOnly {
