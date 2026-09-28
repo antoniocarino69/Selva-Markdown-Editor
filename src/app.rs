@@ -141,31 +141,12 @@ impl NotesApp {
         let name = node.path.file_name().unwrap_or_default().to_string_lossy();
 
         if node.is_dir {
-            let id = ui.make_persistent_id(&node.path);
-            let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, true);
-            
+            let mut header = egui::CollapsingHeader::new(name).default_open(true);
             if let Some(force) = self.force_expand_collapse {
-                state.set_open(force);
+                header = header.open(Some(force));
             }
 
-            let header_res = state.show_header(ui, |ui| {
-                ui.label(name);
-            });
-            
-            header_res.body_returned.unwrap_or(()); // Render header
-
-            header_res.header_response.context_menu(|ui| {
-                if ui.button("➕ New Note").clicked() {
-                    action = FileAction::CreateNote(node.path.clone());
-                    ui.close_menu();
-                }
-                if ui.button("📂 Open in Explorer").clicked() {
-                    let _ = open::that(&node.path);
-                    ui.close_menu();
-                }
-            });
-
-            state.show_body_indented(&header_res.header_response, ui, |ui| {
+            let response = header.show(ui, |ui| {
                 if let Some(children) = &node.children {
                     for child in children {
                         let child_action = self.render_file_tree(ui, child);
@@ -173,6 +154,17 @@ impl NotesApp {
                             action = child_action;
                         }
                     }
+                }
+            });
+
+            response.header_response.context_menu(|ui| {
+                if ui.button("➕ New Note").clicked() {
+                    action = FileAction::CreateNote(node.path.clone());
+                    ui.close_menu();
+                }
+                if ui.button("📂 Open in Explorer").clicked() {
+                    let _ = open::that(&node.path);
+                    ui.close_menu();
                 }
             });
         } else {
