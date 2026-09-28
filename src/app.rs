@@ -37,6 +37,7 @@ pub struct NotesApp {
     create_note_target_dir: Option<PathBuf>,
     image_cache: std::collections::HashMap<String, PathBuf>,
     pending_editor_action: Option<EditorAction>,
+    last_text_edit_state: Option<egui::text_edit::TextEditState>,
 }
 
 struct FileNode {
@@ -120,6 +121,7 @@ impl NotesApp {
             create_note_target_dir: None,
             image_cache,
             pending_editor_action: None,
+            last_text_edit_state: None,
         }
     }
 
@@ -405,6 +407,17 @@ impl eframe::App for NotesApp {
                                 .desired_width(f32::INFINITY)
                                 .show(ui)
                         }).inner;
+
+                    let is_right_click = ui.input(|i| i.pointer.secondary_down() || i.pointer.secondary_pressed() || i.pointer.secondary_released());
+                    if is_right_click {
+                        if let Some(state) = self.last_text_edit_state.clone() {
+                            state.store(ui.ctx(), output.response.id);
+                        }
+                    } else {
+                        if let Some(state) = egui::TextEdit::load_state(ui.ctx(), output.response.id) {
+                            self.last_text_edit_state = Some(state);
+                        }
+                    }
 
                     output.response.context_menu(|ui| {
                         if ui.button("✂ Cut").clicked() {
