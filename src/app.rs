@@ -28,6 +28,7 @@ pub struct NotesApp {
     display_mode: DisplayMode,
     force_expand_collapse: Option<bool>,
     create_note_target_dir: Option<PathBuf>,
+    image_cache: std::collections::HashMap<String, PathBuf>,
 }
 
 struct FileNode {
@@ -61,6 +62,24 @@ impl FileNode {
     }
 }
 
+fn build_image_cache(workspace_dir: &Path) -> std::collections::HashMap<String, PathBuf> {
+    let mut cache = std::collections::HashMap::new();
+    for entry in walkdir::WalkDir::new(workspace_dir).into_iter().filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if path.is_file() {
+            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                let ext = ext.to_lowercase();
+                if matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "svg" | "webp") {
+                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                        cache.insert(name.to_string(), path.to_path_buf());
+                    }
+                }
+            }
+        }
+    }
+    cache
+}
+
 impl NotesApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let mut workspace_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -78,6 +97,7 @@ impl NotesApp {
         }
 
         let file_tree = FileNode::new(workspace_dir.clone());
+        let image_cache = build_image_cache(&workspace_dir);
 
         Self {
             workspace_dir,
@@ -90,6 +110,7 @@ impl NotesApp {
             display_mode,
             force_expand_collapse: None,
             create_note_target_dir: None,
+            image_cache,
         }
     }
 
@@ -211,6 +232,7 @@ impl eframe::App for NotesApp {
                         }
                         if ui.button("🔄").on_hover_text("Refresh").clicked() {
                             self.file_tree = FileNode::new(self.workspace_dir.clone());
+                            self.image_cache = build_image_cache(&self.workspace_dir);
                         }
                         if ui.button("➕").on_hover_text("New Note").clicked() {
                             self.is_creating_note = true;
@@ -220,7 +242,8 @@ impl eframe::App for NotesApp {
                         if ui.button("📂").on_hover_text("Open Folder").clicked() {
                             if let Some(folder) = rfd::FileDialog::new().pick_folder() {
                                 self.workspace_dir = folder.clone();
-                                self.file_tree = FileNode::new(folder);
+                                self.file_tree = FileNode::new(folder.clone());
+                                self.image_cache = build_image_cache(&folder);
                                 self.current_file_path = None;
                                 self.editor_text = String::new();
                             }
@@ -299,6 +322,21 @@ impl eframe::App for NotesApp {
             }
         }
 
+        // Preprocess obsidian-style wiki-links
+        let mut processed_text = self.editor_text.clone();
+        if is_markdown {
+            let re = regex::Regex::new(r"!\[\[(.*?)\]\]").unwrap();
+            processed_text = re.replace_all(&processed_text, |caps: &regex::Captures| {
+                let img_name = &caps[1];
+                let filename = img_name.split('|').next().unwrap_or(img_name);
+                if let Some(path) = self.image_cache.get(filename) {
+                    format!("![{}]({}://{})", filename, "file", path.to_string_lossy().replace('\\', "/"))
+                } else {
+                    format!("![[{}]]", img_name)
+                }
+            }).to_string();
+        }
+
         // Right panel for preview, ONLY in split mode
         let show_right_preview = is_markdown && self.display_mode == DisplayMode::EditAndPreview;
 
@@ -311,7 +349,7 @@ impl eframe::App for NotesApp {
                     ui.separator();
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         CommonMarkViewer::new("viewer")
-                            .show(ui, &mut self.commonmark_cache, &self.editor_text);
+                            .show(ui, &mut self.commonmark_cache, &processed_text);
                     });
                 });
         }
@@ -328,7 +366,7 @@ impl eframe::App for NotesApp {
                     // Full screen preview
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         CommonMarkViewer::new("central_viewer")
-                            .show(ui, &mut self.commonmark_cache, &self.editor_text);
+                            .show(ui, &mut self.commonmark_cache, &processed_text);
                     });
                 } else {
                     // Editor
@@ -343,7 +381,30 @@ impl eframe::App for NotesApp {
                                 .show(ui)
                         }).inner;
 
-                    if output.response.changed() {
+                    let mut pasted_image = false;
+                    if output.response.has_focus() && ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::V)) {
+                        if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                            if let Ok(img_data) = clipboard.get_image() {
+                                let target_dir = self.workspace_dir.join("_assets");
+                                let _ = fs::create_dir_all(&target_dir);
+                                let filename = format!("Pasted image {}.png", chrono::Local::now().format("%Y%m%d%H%M%S"));
+                                let file_path = target_dir.join(&filename);
+                                if let Some(img_buffer) = image::RgbaImage::from_raw(
+                                    img_data.width.try_into().unwrap(), 
+                                    img_data.height.try_into().unwrap(), 
+                                    img_data.bytes.into_owned()
+                                ) {
+                                    if img_buffer.save(&file_path).is_ok() {
+                                        self.editor_text.push_str(&format!("\n![[{}]]\n", filename));
+                                        self.image_cache.insert(filename, file_path);
+                                        pasted_image = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if output.response.changed() || pasted_image {
                         let new_text_len = self.editor_text.chars().count();
                         // Auto-pairing logic
                         if new_text_len == previous_text_len + 1 {
