@@ -24,3 +24,6 @@ regex = "1.10"
 chrono = "0.4"
 image = "0.25"
 
+[build-dependencies]
+winres = "0.1.12"
+
