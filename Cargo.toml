@@ -3,6 +3,10 @@ name = "markdown_notes"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "selva"
+path = "src/main.rs"
+
 [dependencies]
 eframe = { version = "0.27", features = ["persistence"] }
 serde = { version = "1.0", features = ["derive"] }
