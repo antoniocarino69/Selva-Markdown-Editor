@@ -3,11 +3,18 @@ use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-#[derive(PartialEq)]
+#[derive(PartialEq, serde::Serialize, serde::Deserialize)]
 enum DisplayMode {
     ViewOnly,
     EditAndPreview,
     EditOnly,
+}
+
+enum FileAction {
+    None,
+    Open(PathBuf),
+    Delete(PathBuf),
+    CreateNote(PathBuf),
 }
 
 pub struct NotesApp {
@@ -19,6 +26,8 @@ pub struct NotesApp {
     is_creating_note: bool,
     new_note_name: String,
     display_mode: DisplayMode,
+    force_expand_collapse: Option<bool>,
+    create_note_target_dir: Option<PathBuf>,
 }
 
 struct FileNode {
@@ -53,8 +62,21 @@ impl FileNode {
 }
 
 impl NotesApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
-        let workspace_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let mut workspace_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let mut display_mode = DisplayMode::EditAndPreview;
+
+        if let Some(storage) = cc.storage {
+            if let Some(saved_dir) = eframe::get_value::<PathBuf>(storage, "workspace_dir") {
+                if saved_dir.exists() {
+                    workspace_dir = saved_dir;
+                }
+            }
+            if let Some(saved_mode) = eframe::get_value::<DisplayMode>(storage, "display_mode") {
+                display_mode = saved_mode;
+            }
+        }
+
         let file_tree = FileNode::new(workspace_dir.clone());
 
         Self {
@@ -65,7 +87,9 @@ impl NotesApp {
             file_tree,
             is_creating_note: false,
             new_note_name: String::new(),
-            display_mode: DisplayMode::EditAndPreview,
+            display_mode,
+            force_expand_collapse: None,
+            create_note_target_dir: None,
         }
     }
 
@@ -112,34 +136,73 @@ impl NotesApp {
         }
     }
 
-    fn render_file_tree(&self, ui: &mut egui::Ui, node: &FileNode) -> Option<PathBuf> {
-        let mut clicked_path = None;
+    fn render_file_tree(&self, ui: &mut egui::Ui, node: &FileNode) -> FileAction {
+        let mut action = FileAction::None;
+        let name = node.path.file_name().unwrap_or_default().to_string_lossy();
+
         if node.is_dir {
-            let name = node.path.file_name().unwrap_or_default().to_string_lossy();
-            egui::CollapsingHeader::new(name)
-                .default_open(true)
-                .show(ui, |ui| {
-                    if let Some(children) = &node.children {
-                        for child in children {
-                            if let Some(p) = self.render_file_tree(ui, child) {
-                                clicked_path = Some(p);
-                            }
+            let id = ui.make_persistent_id(&node.path);
+            let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, true);
+            
+            if let Some(force) = self.force_expand_collapse {
+                state.set_open(force);
+            }
+
+            let header_res = state.show_header(ui, |ui| {
+                ui.label(name);
+            });
+            
+            header_res.body_returned.unwrap_or(()); // Render header
+
+            header_res.header_response.context_menu(|ui| {
+                if ui.button("➕ New Note").clicked() {
+                    action = FileAction::CreateNote(node.path.clone());
+                    ui.close_menu();
+                }
+                if ui.button("📂 Open in Explorer").clicked() {
+                    let _ = open::that(&node.path);
+                    ui.close_menu();
+                }
+            });
+
+            state.show_body_indented(&header_res.header_response, ui, |ui| {
+                if let Some(children) = &node.children {
+                    for child in children {
+                        let child_action = self.render_file_tree(ui, child);
+                        if !matches!(child_action, FileAction::None) {
+                            action = child_action;
                         }
                     }
-                });
+                }
+            });
         } else {
-            let name = node.path.file_name().unwrap_or_default().to_string_lossy();
-            if ui.selectable_label(self.current_file_path.as_ref() == Some(&node.path), name).clicked() {
-                clicked_path = Some(node.path.clone());
+            let res = ui.selectable_label(self.current_file_path.as_ref() == Some(&node.path), name);
+            if res.clicked() {
+                action = FileAction::Open(node.path.clone());
             }
+            res.context_menu(|ui| {
+                if ui.button("🗑 Delete").clicked() {
+                    action = FileAction::Delete(node.path.clone());
+                    ui.close_menu();
+                }
+                if ui.button("📂 Open in Explorer").clicked() {
+                    let _ = open::that(node.path.parent().unwrap_or(&node.path));
+                    ui.close_menu();
+                }
+            });
         }
-        clicked_path
+        action
     }
 }
 
 impl eframe::App for NotesApp {
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        eframe::set_value(storage, "workspace_dir", &self.workspace_dir);
+        eframe::set_value(storage, "display_mode", &self.display_mode);
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let mut file_to_open = None;
+        let mut action = FileAction::None;
 
         egui::SidePanel::left("file_explorer_panel")
             .resizable(true)
@@ -148,12 +211,19 @@ impl eframe::App for NotesApp {
                 ui.horizontal(|ui| {
                     ui.heading("Explorer");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("🔽").on_hover_text("Collapse All").clicked() {
+                            self.force_expand_collapse = Some(false);
+                        }
+                        if ui.button("▶").on_hover_text("Expand All").clicked() {
+                            self.force_expand_collapse = Some(true);
+                        }
                         if ui.button("🔄").on_hover_text("Refresh").clicked() {
                             self.file_tree = FileNode::new(self.workspace_dir.clone());
                         }
                         if ui.button("➕").on_hover_text("New Note").clicked() {
                             self.is_creating_note = true;
                             self.new_note_name = String::from("Untitled.md");
+                            self.create_note_target_dir = Some(self.workspace_dir.clone());
                         }
                         if ui.button("📂").on_hover_text("Open Folder").clicked() {
                             if let Some(folder) = rfd::FileDialog::new().pick_folder() {
@@ -181,13 +251,13 @@ impl eframe::App for NotesApp {
                     ui.horizontal(|ui| {
                         ui.text_edit_singleline(&mut self.new_note_name);
                         if ui.button("Create").clicked() {
-                            let new_path = self.workspace_dir.join(&self.new_note_name);
+                            let target_dir = self.create_note_target_dir.clone().unwrap_or(self.workspace_dir.clone());
+                            let new_path = target_dir.join(&self.new_note_name);
                             if !new_path.exists() {
                                 let _ = fs::write(&new_path, "");
                                 // Refresh tree and open new file
                                 self.file_tree = FileNode::new(self.workspace_dir.clone());
-                                self.current_file_path = Some(new_path);
-                                self.editor_text = String::new();
+                                self.open_file(&new_path);
                             }
                             self.is_creating_note = false;
                         }
@@ -199,15 +269,33 @@ impl eframe::App for NotesApp {
 
                 ui.separator();
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    if let Some(path) = self.render_file_tree(ui, &self.file_tree) {
-                        file_to_open = Some(path);
+                    let tree_action = self.render_file_tree(ui, &self.file_tree);
+                    if !matches!(tree_action, FileAction::None) {
+                        action = tree_action;
                     }
                 });
             });
 
-        if let Some(path) = file_to_open {
-            self.open_file(&path);
+        match action {
+            FileAction::Open(path) => self.open_file(&path),
+            FileAction::Delete(path) => {
+                let _ = fs::remove_file(&path);
+                self.file_tree = FileNode::new(self.workspace_dir.clone());
+                if self.current_file_path == Some(path) {
+                    self.current_file_path = None;
+                    self.editor_text = String::new();
+                }
+            }
+            FileAction::CreateNote(path) => {
+                self.is_creating_note = true;
+                self.new_note_name = String::from("Untitled.md");
+                self.create_note_target_dir = Some(path);
+            }
+            FileAction::None => {}
         }
+        
+        // Reset force expand/collapse after one frame
+        self.force_expand_collapse = None;
 
         // Determine if it's a markdown file
         let mut is_markdown = false;
