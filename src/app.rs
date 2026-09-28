@@ -449,7 +449,16 @@ impl eframe::App for NotesApp {
                                     img_data.bytes.into_owned()
                                 ) {
                                     if img_buffer.save(&file_path).is_ok() {
-                                        self.editor_text.push_str(&format!("\n![[{}]]\n", filename));
+                                        let insert_text = format!("![[{}]]", filename);
+                                        if let Some(cursor_range) = output.cursor_range {
+                                            let min = cursor_range.primary.ccursor.index.min(cursor_range.secondary.ccursor.index);
+                                            let max = cursor_range.primary.ccursor.index.max(cursor_range.secondary.ccursor.index);
+                                            let byte_min = self.editor_text.char_indices().nth(min).map(|(i, _)| i).unwrap_or(self.editor_text.len());
+                                            let byte_max = self.editor_text.char_indices().nth(max).map(|(i, _)| i).unwrap_or(self.editor_text.len());
+                                            self.editor_text.replace_range(byte_min..byte_max, &insert_text);
+                                        } else {
+                                            self.editor_text.push_str(&format!("\n{}\n", insert_text));
+                                        }
                                         self.image_cache.insert(filename, file_path);
                                         pasted_image = true;
                                     }
@@ -479,7 +488,8 @@ impl eframe::App for NotesApp {
                                     };
                                     
                                     if let Some(p) = pair {
-                                        self.editor_text.insert(cursor_idx, p);
+                                        let byte_idx = self.editor_text.char_indices().nth(cursor_idx).map(|(i, _)| i).unwrap_or(self.editor_text.len());
+                                        self.editor_text.insert(byte_idx, p);
                                     }
                                 }
                             }
