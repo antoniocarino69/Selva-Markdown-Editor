@@ -31,6 +31,44 @@ struct DraggedNote {
     vault: PathBuf,
 }
 
+const EXPLORER_ROW_HEIGHT: f32 = 26.0;
+
+fn explorer_row(ui: &mut egui::Ui, path: &Path, label: &str, selected: bool) -> egui::Response {
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), EXPLORER_ROW_HEIGHT),
+        egui::Sense::hover(),
+    );
+    let response = ui.interact(
+        rect,
+        egui::Id::new(("explorer_row", path)),
+        egui::Sense::click(),
+    );
+    if ui.is_rect_visible(rect) {
+        let visuals = ui.style().interact_selectable(&response, selected);
+        if selected || response.hovered() || response.has_focus() {
+            ui.painter().rect(
+                rect,
+                visuals.rounding,
+                visuals.weak_bg_fill,
+                visuals.bg_stroke,
+            );
+        }
+        let galley = ui.painter().layout_no_wrap(
+            label.to_owned(),
+            egui::TextStyle::Button.resolve(ui.style()),
+            visuals.text_color(),
+        );
+        let position = egui::pos2(
+            rect.left() + ui.spacing().button_padding.x,
+            rect.center().y - galley.size().y / 2.0,
+        );
+        ui.painter()
+            .with_clip_rect(ui.clip_rect().intersect(rect))
+            .galley(position, galley, visuals.text_color());
+    }
+    response
+}
+
 fn note_drag_source(response: egui::Response, path: &Path, vault: &Path) -> egui::Response {
     if !matches!(open_kind(path), OpenKind::Markdown | OpenKind::Text) {
         return response;
@@ -274,6 +312,7 @@ struct VaultIndex {
 }
 
 enum ScanMessage {
+    Preview(FileNode),
     Tree(FileNode),
     Ready(VaultIndex),
     Error(String),
@@ -306,7 +345,7 @@ fn scan_vault(
         }
     }
     sort_nodes(shallow.children.as_mut().unwrap());
-    if tx.send(ScanMessage::Tree(shallow)).is_err() {
+    if tx.send(ScanMessage::Preview(shallow)).is_err() {
         return;
     }
     let mut children: std::collections::HashMap<PathBuf, Vec<FileNode>> =
@@ -742,8 +781,24 @@ impl NotesApp {
     }
 
     fn poll_scan(&mut self, ctx: &egui::Context) {
+        // Keep targets under the pointer stable until the drag has finished.
+        if egui::DragAndDrop::has_payload_of_type::<DraggedNote>(ctx) {
+            return;
+        }
         if let Some(rx) = &self.scan {
             match rx.try_recv() {
+                Ok(ScanMessage::Preview(tree)) => {
+                    // A shallow startup preview must not collapse an already populated tree.
+                    if self
+                        .file_tree
+                        .children
+                        .as_ref()
+                        .map_or(true, |children| children.is_empty())
+                    {
+                        self.file_tree = tree;
+                    }
+                    ctx.request_repaint();
+                }
                 Ok(ScanMessage::Tree(tree)) => {
                     self.file_tree = tree;
                     ctx.request_repaint();
@@ -1234,11 +1289,7 @@ impl NotesApp {
                     ui.add_space(3.0);
                 });
                 ui.separator();
-                let root_response = ui
-                    .add_sized(
-                        [ui.available_width(), 22.0],
-                        egui::SelectableLabel::new(false, "Vault root"),
-                    )
+                let root_response = explorer_row(ui, &self.workspace_dir, "Vault root", false)
                     .on_hover_text("Drop a note here to move it to the vault root");
                 note_drop_target(
                     ui,
@@ -1247,16 +1298,6 @@ impl NotesApp {
                     &self.workspace_dir,
                     &mut action,
                 );
-                if self.scan.is_some() {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label(if self.content_requested {
-                            "Indexing contents…"
-                        } else {
-                            "Opening vault…"
-                        });
-                    });
-                }
                 if self.search.trim().is_empty()
                     || egui::DragAndDrop::has_payload_of_type::<DraggedNote>(ctx)
                 {
@@ -1265,7 +1306,7 @@ impl NotesApp {
                     egui::ScrollArea::vertical()
                         .id_source("vault_files")
                         .auto_shrink([false, false])
-                        .show_rows(ui, 26.0, rows.len(), |ui, range| {
+                        .show_rows(ui, EXPLORER_ROW_HEIGHT, rows.len(), |ui, range| {
                             for index in range {
                                 let node = rows[index];
                                 let depth = node
@@ -1304,19 +1345,13 @@ impl NotesApp {
                                         ));
                                     }
                                     let label = name.into_owned();
-                                    let response = ui
-                                        .push_id(&node.path, |ui| {
-                                            ui.add_sized(
-                                                [ui.available_width(), 20.0],
-                                                egui::SelectableLabel::new(
-                                                    self.current_file_path.as_ref()
-                                                        == Some(&node.path),
-                                                    label,
-                                                ),
-                                            )
-                                            .on_hover_text(node.path.display().to_string())
-                                        })
-                                        .inner;
+                                    let response = explorer_row(
+                                        ui,
+                                        &node.path,
+                                        &label,
+                                        self.current_file_path.as_ref() == Some(&node.path),
+                                    )
+                                    .on_hover_text(node.path.display().to_string());
                                     let response = if node.is_dir {
                                         if note_drop_target(
                                             ui,
@@ -1373,26 +1408,34 @@ impl NotesApp {
                     ui.small(format!("{} results", self.search_results.len()));
                     egui::ScrollArea::vertical()
                         .id_source("search_results")
-                        .show_rows(ui, 26.0, self.search_results.len(), |ui, range| {
-                            for index in range {
-                                let path = &self.search_results[index];
-                                let response = ui.selectable_label(
-                                    self.current_file_path.as_ref() == Some(path),
-                                    path.strip_prefix(&self.workspace_dir)
-                                        .unwrap_or(path)
-                                        .display()
-                                        .to_string(),
-                                );
-                                let response =
-                                    note_drag_source(response, path, &self.workspace_dir);
-                                if response.clicked() {
-                                    action = FileAction::Open(path.clone());
+                        .show_rows(
+                            ui,
+                            EXPLORER_ROW_HEIGHT,
+                            self.search_results.len(),
+                            |ui, range| {
+                                for index in range {
+                                    let path = &self.search_results[index];
+                                    let response = explorer_row(
+                                        ui,
+                                        path,
+                                        &path
+                                            .strip_prefix(&self.workspace_dir)
+                                            .unwrap_or(path)
+                                            .display()
+                                            .to_string(),
+                                        self.current_file_path.as_ref() == Some(path),
+                                    );
+                                    let response =
+                                        note_drag_source(response, path, &self.workspace_dir);
+                                    if response.clicked() {
+                                        action = FileAction::Open(path.clone());
+                                    }
+                                    response.context_menu(|ui| {
+                                        file_context_menu(ui, path, false, &mut action);
+                                    });
                                 }
-                                response.context_menu(|ui| {
-                                    file_context_menu(ui, path, false, &mut action);
-                                });
-                            }
-                        });
+                            },
+                        );
                 }
             });
         if let Some(parent) = self.create_folder_target.clone() {
@@ -1957,6 +2000,69 @@ mod tests {
     }
 
     #[test]
+    fn explorer_rows_stay_left_aligned_and_do_not_jump_during_refresh() {
+        let root = fixture();
+        let folder = root.join("Folder");
+        let mut app = test_app(root.clone());
+        let long_name = "A very long note title that must stay on one single explorer row.md";
+        app.file_tree.children = Some(vec![FileNode {
+            path: folder.clone(),
+            is_dir: true,
+            children: Some(vec![
+                FileNode {
+                    path: folder.join("A.md"),
+                    is_dir: false,
+                    children: None,
+                },
+                FileNode {
+                    path: folder.join(long_name),
+                    is_dir: false,
+                    children: None,
+                },
+            ]),
+        }]);
+        app.expanded.insert(folder);
+        let ctx = egui::Context::default();
+        pointer_frame(&mut app, &ctx, vec![]);
+        let output = pointer_frame(&mut app, &ctx, vec![]);
+        let short = text_position(&output, "A.md");
+        let long = text_position(&output, long_name);
+        let parent = text_position(&output, "Folder");
+        assert!((short.x - long.x).abs() < 0.1);
+        assert!((short.x - parent.x - 14.0).abs() < 0.1);
+        assert!(parent.x < 55.0);
+        assert!(text_position(&output, "Vault root").x < 25.0);
+        assert!(
+            (long.y - short.y - EXPLORER_ROW_HEIGHT - ctx.style().spacing.item_spacing.y).abs()
+                < 0.1
+        );
+
+        let (tx, rx) = mpsc::channel();
+        app.scan = Some(rx);
+        tx.send(ScanMessage::Preview(empty_tree(root.clone())))
+            .unwrap();
+        let loading = pointer_frame(&mut app, &ctx, vec![]);
+        assert_eq!(text_position(&loading, "A.md"), short);
+        assert_eq!(text_position(&loading, long_name), long);
+
+        // Even a full replacement is deferred while a note is being dragged.
+        tx.send(ScanMessage::Tree(empty_tree(root.clone())))
+            .unwrap();
+        egui::DragAndDrop::set_payload(
+            &ctx,
+            DraggedNote {
+                path: root.join("Dragged.md"),
+                vault: root,
+            },
+        );
+        let dragging = pointer_frame(&mut app, &ctx, vec![]);
+        assert_eq!(text_position(&dragging, "A.md"), short);
+        egui::DragAndDrop::clear_payload(&ctx);
+        pointer_frame(&mut app, &ctx, vec![]);
+        assert!(app.file_tree.children.as_ref().unwrap().is_empty());
+    }
+
+    #[test]
     fn pointer_drag_moves_notes_from_tree_and_search_and_escape_cancels() {
         for (search, cancel) in [(false, false), (true, false), (false, true)] {
             let root = fixture();
@@ -2102,7 +2208,7 @@ mod tests {
         fs::write(root.join("foto.png"), "placeholder").unwrap();
         let (tx, rx) = mpsc::channel();
         scan_vault(root.clone(), Arc::new(AtomicBool::new(false)), tx, true);
-        assert!(matches!(rx.recv().unwrap(), ScanMessage::Tree(_)));
+        assert!(matches!(rx.recv().unwrap(), ScanMessage::Preview(_)));
         let tree = match rx.recv().unwrap() {
             ScanMessage::Tree(tree) => tree,
             _ => panic!("Missing tree"),
@@ -2254,7 +2360,7 @@ mod tests {
         let mut first = true;
         for message in rx {
             match message {
-                ScanMessage::Tree(_) if first => {
+                ScanMessage::Preview(_) if first => {
                     println!("First folders: {:?}", started.elapsed());
                     first = false;
                 }
