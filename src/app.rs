@@ -21,13 +21,7 @@ enum FileAction {
     Open(PathBuf),
     Delete(PathBuf),
     CreateNote(PathBuf),
-}
-
-#[derive(PartialEq)]
-enum EditorAction {
-    Cut,
-    Copy,
-    Paste,
+    CreateFolder(PathBuf),
 }
 
 pub struct NotesApp {
@@ -59,8 +53,9 @@ pub struct NotesApp {
     light_theme: bool,
     create_note_target_dir: Option<PathBuf>,
     image_cache: std::collections::HashMap<String, PathBuf>,
-    pending_editor_action: Option<EditorAction>,
-    last_text_edit_state: Option<egui::text_edit::TextEditState>,
+    create_folder_target: Option<PathBuf>,
+    new_folder_name: String,
+    folder_error: String,
 }
 
 struct FileNode {
@@ -465,8 +460,9 @@ impl NotesApp {
             light_theme,
             create_note_target_dir: None,
             image_cache,
-            pending_editor_action: None,
-            last_text_edit_state: None,
+            create_folder_target: None,
+            new_folder_name: String::new(),
+            folder_error: String::new(),
         };
         if let Some(storage) = cc.storage {
             if let Some(path) =
@@ -537,7 +533,6 @@ impl NotesApp {
                 self.current_file_path = Some(path.to_path_buf());
                 self.saved_text = content.clone();
                 self.editor_text = content;
-                self.last_text_edit_state = None;
                 self.focus_editor = true;
                 self.last_edit = None;
                 self.refresh_backlinks();
@@ -678,6 +673,8 @@ impl NotesApp {
             self.search_contents = false;
             self.show_connections = false;
             self.workspace_dir = folder;
+            self.create_folder_target = None;
+            self.is_creating_note = false;
             self.current_file_path = None;
             self.image_view = None;
             self.editor_text.clear();
@@ -691,6 +688,33 @@ impl NotesApp {
             self.indexed_query = None;
             self.file_tree = empty_tree(self.workspace_dir.clone());
             self.refresh();
+        }
+    }
+
+    fn create_folder(&mut self) {
+        let Some(parent) = self.create_folder_target.as_ref() else {
+            return;
+        };
+        let name = self.new_folder_name.trim();
+        if !valid_note_name(name) || !visible_path(Path::new(name)) {
+            self.folder_error =
+                "Use a visible folder name without a path or reserved characters.".into();
+            return;
+        }
+        let path = parent.join(name);
+        match fs::create_dir(&path) {
+            Ok(()) => {
+                for ancestor in path.ancestors().skip(1) {
+                    if ancestor.starts_with(&self.workspace_dir) {
+                        self.expanded.insert(ancestor.to_path_buf());
+                    }
+                }
+                self.search.clear();
+                self.create_folder_target = None;
+                self.folder_error.clear();
+                self.refresh();
+            }
+            Err(error) => self.folder_error = format!("Could not create folder: {error}"),
         }
     }
 
@@ -790,22 +814,6 @@ impl NotesApp {
             });
         });
         let mut action = FileAction::None;
-        let mut is_paste_action = false;
-
-        if let Some(editor_act) = self.pending_editor_action.take() {
-            match editor_act {
-                EditorAction::Cut => ctx.input_mut(|i| i.events.push(egui::Event::Cut)),
-                EditorAction::Copy => ctx.input_mut(|i| i.events.push(egui::Event::Copy)),
-                EditorAction::Paste => {
-                    is_paste_action = true;
-                    if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                        if let Ok(text) = clipboard.get_text() {
-                            ctx.input_mut(|i| i.events.push(egui::Event::Paste(text)));
-                        }
-                    }
-                }
-            }
-        }
 
         egui::SidePanel::left("vault_sidebar_v2")
             .resizable(true)
@@ -839,6 +847,12 @@ impl NotesApp {
                                     |ui| {
                                         ui.set_min_width(190.0);
                                         ui.weak("VAULT");
+                                        if ui.button("New folder…").clicked() {
+                                            action = FileAction::CreateFolder(
+                                                self.workspace_dir.clone(),
+                                            );
+                                            ui.close_menu();
+                                        }
                                         if ui.button("Open another vault…").clicked() {
                                             self.choose_vault();
                                             ui.close_menu();
@@ -1060,6 +1074,11 @@ impl NotesApp {
                                     }
                                     response.context_menu(|ui| {
                                         if node.is_dir {
+                                            if ui.button("New folder here…").clicked() {
+                                                action =
+                                                    FileAction::CreateFolder(node.path.clone());
+                                                ui.close_menu();
+                                            }
                                             if ui.button("New note here").clicked() {
                                                 action = FileAction::CreateNote(node.path.clone());
                                                 ui.close_menu();
@@ -1116,6 +1135,38 @@ impl NotesApp {
                         });
                 }
             });
+        if let Some(parent) = self.create_folder_target.clone() {
+            egui::Window::new("New folder")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label(format!("Inside: {}", parent.display()));
+                    let name = ui.add(
+                        egui::TextEdit::singleline(&mut self.new_folder_name)
+                            .hint_text("Folder name")
+                            .desired_width(320.0),
+                    );
+                    if self.new_folder_name.is_empty() && !name.has_focus() {
+                        name.request_focus();
+                    }
+                    if !self.folder_error.is_empty() {
+                        ui.colored_label(ui.visuals().error_fg_color, &self.folder_error);
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("Create folder").clicked()
+                            || (name.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                        {
+                            self.create_folder();
+                        }
+                        if ui.button("Cancel").clicked()
+                            || ui.input(|i| i.key_pressed(egui::Key::Escape))
+                        {
+                            self.create_folder_target = None;
+                        }
+                    });
+                });
+        }
         if self.is_creating_note {
             egui::Window::new("New note")
                 .collapsible(false)
@@ -1176,9 +1227,16 @@ impl NotesApp {
                 }
             }
             FileAction::CreateNote(path) => {
+                self.create_folder_target = None;
                 self.is_creating_note = true;
                 self.new_note_name = String::from("New note.md");
                 self.create_note_target_dir = Some(path);
+            }
+            FileAction::CreateFolder(path) => {
+                self.is_creating_note = false;
+                self.create_folder_target = Some(path);
+                self.new_folder_name.clear();
+                self.folder_error.clear();
             }
             FileAction::None => {}
         }
@@ -1335,47 +1393,17 @@ impl NotesApp {
                         })
                         .inner;
 
-                    if self.focus_editor && !self.is_creating_note {
+                    if self.focus_editor
+                        && !self.is_creating_note
+                        && self.create_folder_target.is_none()
+                    {
                         output.response.request_focus();
                         self.focus_editor = false;
                     }
-                    let is_right_click = ui.input(|i| {
-                        i.pointer.secondary_down()
-                            || i.pointer.secondary_pressed()
-                            || i.pointer.secondary_released()
-                    });
-                    if is_right_click {
-                        if let Some(state) = self.last_text_edit_state.clone() {
-                            state.store(ui.ctx(), output.response.id);
-                        }
-                    } else {
-                        if let Some(state) =
-                            egui::TextEdit::load_state(ui.ctx(), output.response.id)
-                        {
-                            self.last_text_edit_state = Some(state);
-                        }
-                    }
-
-                    output.response.context_menu(|ui| {
-                        if ui.button("Cut").clicked() {
-                            self.pending_editor_action = Some(EditorAction::Cut);
-                            ui.close_menu();
-                        }
-                        if ui.button("Copy").clicked() {
-                            self.pending_editor_action = Some(EditorAction::Copy);
-                            ui.close_menu();
-                        }
-                        if ui.button("Paste").clicked() {
-                            self.pending_editor_action = Some(EditorAction::Paste);
-                            ui.close_menu();
-                        }
-                    });
-
                     let mut pasted_image = false;
-                    let is_ctrl_v = ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::V));
-                    if is_markdown
-                        && ((output.response.has_focus() && is_ctrl_v) || is_paste_action)
-                    {
+                    let is_ctrl_v =
+                        ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::V));
+                    if is_markdown && output.response.has_focus() && is_ctrl_v {
                         if let Ok(mut clipboard) = arboard::Clipboard::new() {
                             if let Ok(img_data) = clipboard.get_image() {
                                 let target_dir = self.workspace_dir.join("_assets");
@@ -1532,9 +1560,69 @@ mod tests {
             light_theme: false,
             create_note_target_dir: None,
             image_cache: std::collections::HashMap::new(),
-            pending_editor_action: None,
-            last_text_edit_state: None,
+            create_folder_target: None,
+            new_folder_name: String::new(),
+            folder_error: String::new(),
         }
+    }
+
+    #[test]
+    fn creates_nested_folders_without_changing_the_open_note() {
+        let root = fixture();
+        let mut app = test_app(root.clone());
+        app.editor_text = "Unsaved draft".into();
+        let mut parent = root.clone();
+        for name in ["Projects", "Notes", "Ideas"] {
+            app.create_folder_target = Some(parent.clone());
+            app.new_folder_name = name.into();
+            app.create_folder();
+            assert!(app.create_folder_target.is_none());
+            assert!(app.expanded.contains(&parent));
+            parent = parent.join(name);
+            assert!(parent.is_dir());
+        }
+        assert_eq!(app.editor_text, "Unsaved draft");
+        let (tx, rx) = mpsc::channel();
+        scan_vault(root, Arc::new(AtomicBool::new(false)), tx, false);
+        let _ = rx.recv().unwrap();
+        let ScanMessage::Tree(tree) = rx.recv().unwrap() else {
+            panic!("Missing full tree");
+        };
+        let mut rows = Vec::new();
+        tree_rows(&tree, &app.expanded, &mut rows);
+        assert!(rows.iter().any(|node| node.path == parent));
+    }
+
+    #[test]
+    fn folder_creation_rejects_invalid_names_and_preserves_existing_entries() {
+        let root = fixture();
+        fs::create_dir(root.join("Existing")).unwrap();
+        fs::write(root.join("Existing/Keep.md"), "keep").unwrap();
+        fs::write(root.join("File"), "keep").unwrap();
+        let mut app = test_app(root.clone());
+        for name in [
+            "",
+            "..",
+            "../escape",
+            "a/b",
+            "a\\b",
+            ".hidden",
+            "target",
+            "Existing",
+            "File",
+        ] {
+            app.create_folder_target = Some(root.clone());
+            app.new_folder_name = name.into();
+            app.folder_error.clear();
+            app.create_folder();
+            assert!(!app.folder_error.is_empty(), "{name}");
+            assert!(app.create_folder_target.is_some());
+        }
+        assert_eq!(
+            fs::read_to_string(root.join("Existing/Keep.md")).unwrap(),
+            "keep"
+        );
+        assert_eq!(fs::read_to_string(root.join("File")).unwrap(), "keep");
     }
 
     #[test]
