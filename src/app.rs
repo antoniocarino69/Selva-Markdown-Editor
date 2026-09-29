@@ -22,6 +22,67 @@ enum FileAction {
     Delete(PathBuf),
     CreateNote(PathBuf),
     CreateFolder(PathBuf),
+    ShowInFileManager(PathBuf),
+}
+
+fn file_context_menu(ui: &mut egui::Ui, path: &Path, is_dir: bool, action: &mut FileAction) {
+    let label = if is_dir {
+        "Open folder in file explorer"
+    } else {
+        "Show in file explorer"
+    };
+    if ui.button(label).clicked() {
+        *action = FileAction::ShowInFileManager(path.to_path_buf());
+        ui.close_menu();
+    }
+    ui.separator();
+    if is_dir {
+        if ui.button("New folder here…").clicked() {
+            *action = FileAction::CreateFolder(path.to_path_buf());
+            ui.close_menu();
+        }
+        if ui.button("New note here").clicked() {
+            *action = FileAction::CreateNote(path.to_path_buf());
+            ui.close_menu();
+        }
+    } else if ui.button("Move to trash").clicked() {
+        *action = FileAction::Delete(path.to_path_buf());
+        ui.close_menu();
+    }
+}
+
+fn file_manager_command(path: &Path) -> std::io::Result<std::process::Command> {
+    // Avoid canonicalize: Windows extended-length paths are not understood by Explorer.
+    let path = std::env::current_dir()?.join(path);
+    let is_dir = fs::metadata(&path)?.is_dir();
+    #[cfg(target_os = "windows")]
+    {
+        let mut command = std::process::Command::new("explorer.exe");
+        if !is_dir {
+            command.arg("/select,");
+        }
+        command.arg(path);
+        Ok(command)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut command = std::process::Command::new("open");
+        if !is_dir {
+            command.arg("-R");
+        }
+        command.arg(path);
+        Ok(command)
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        let mut command = std::process::Command::new("xdg-open");
+        command.arg(if is_dir {
+            &path
+        } else {
+            path.parent().unwrap_or(&path)
+        });
+        Ok(command)
+    }
 }
 
 pub struct NotesApp {
@@ -847,6 +908,12 @@ impl NotesApp {
                                     |ui| {
                                         ui.set_min_width(190.0);
                                         ui.weak("VAULT");
+                                        if ui.button("Open folder in file explorer").clicked() {
+                                            action = FileAction::ShowInFileManager(
+                                                self.workspace_dir.clone(),
+                                            );
+                                            ui.close_menu();
+                                        }
                                         if ui.button("New folder…").clicked() {
                                             action = FileAction::CreateFolder(
                                                 self.workspace_dir.clone(),
@@ -1073,20 +1140,7 @@ impl NotesApp {
                                         }
                                     }
                                     response.context_menu(|ui| {
-                                        if node.is_dir {
-                                            if ui.button("New folder here…").clicked() {
-                                                action =
-                                                    FileAction::CreateFolder(node.path.clone());
-                                                ui.close_menu();
-                                            }
-                                            if ui.button("New note here").clicked() {
-                                                action = FileAction::CreateNote(node.path.clone());
-                                                ui.close_menu();
-                                            }
-                                        } else if ui.button("Move to trash").clicked() {
-                                            action = FileAction::Delete(node.path.clone());
-                                            ui.close_menu();
-                                        }
+                                        file_context_menu(ui, &node.path, node.is_dir, &mut action);
                                     });
                                 });
                             }
@@ -1119,18 +1173,19 @@ impl NotesApp {
                         .show_rows(ui, 26.0, self.search_results.len(), |ui, range| {
                             for index in range {
                                 let path = &self.search_results[index];
-                                if ui
-                                    .selectable_label(
-                                        self.current_file_path.as_ref() == Some(path),
-                                        path.strip_prefix(&self.workspace_dir)
-                                            .unwrap_or(path)
-                                            .display()
-                                            .to_string(),
-                                    )
-                                    .clicked()
-                                {
+                                let response = ui.selectable_label(
+                                    self.current_file_path.as_ref() == Some(path),
+                                    path.strip_prefix(&self.workspace_dir)
+                                        .unwrap_or(path)
+                                        .display()
+                                        .to_string(),
+                                );
+                                if response.clicked() {
                                     action = FileAction::Open(path.clone());
                                 }
+                                response.context_menu(|ui| {
+                                    file_context_menu(ui, path, false, &mut action);
+                                });
                             }
                         });
                 }
@@ -1199,6 +1254,13 @@ impl NotesApp {
         }
 
         match action {
+            FileAction::ShowInFileManager(path) => {
+                if let Err(error) =
+                    file_manager_command(&path).and_then(|mut command| command.spawn())
+                {
+                    self.status = format!("Could not open file explorer: {error}");
+                }
+            }
             FileAction::Open(path) => self.open_file(&path),
             FileAction::Delete(path) => {
                 if !self.save_current_file() {
@@ -1564,6 +1626,28 @@ mod tests {
             new_folder_name: String::new(),
             folder_error: String::new(),
         }
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn explorer_opens_folders_and_selects_files_with_spaces_and_unicode() {
+        let root = fixture();
+        let folder = root.join("Idee e attività");
+        fs::create_dir(&folder).unwrap();
+        let note = folder.join("Nota, perché.md");
+        fs::write(&note, "test").unwrap();
+        let command = file_manager_command(&folder).unwrap();
+        assert_eq!(command.get_program(), "explorer.exe");
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            vec![folder.as_os_str()]
+        );
+        let command = file_manager_command(&note).unwrap();
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            vec![std::ffi::OsStr::new("/select,"), note.as_os_str()]
+        );
+        assert!(file_manager_command(&root.join("Missing.md")).is_err());
     }
 
     #[test]

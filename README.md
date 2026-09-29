@@ -5,6 +5,7 @@ Selva (from Italian "forest") is a blazing fast, local-first Markdown note-takin
 ## Features
 
 - **Nested Folders**: Create a folder from the vault menu, or right-click any folder and choose "New folder here…" to create a subfolder.
+- **File Explorer**: Right-click a folder to open it in the file explorer, or a note to reveal it. These actions are also available in search results and the vault menu.
 - **Clipboard Shortcuts**: Use Ctrl+C, Ctrl+X and Ctrl+V in the editor. The unreliable clipboard context menu has been removed.
 - **Blazing Fast & Lightweight**: Written in Rust using the `egui` framework. Consumes very little RAM and launches instantly.
 - **Obsidian Compatibility**: Fully compatible with your existing Obsidian vaults. It reads your local `.md` files directly and respects your folder structures.
