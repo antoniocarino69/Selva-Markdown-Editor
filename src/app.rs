@@ -31,6 +31,10 @@ const PANEL_MARGIN_X: f32 = 16.0;
 /// Half-width of the custom panel resize grip around each panel edge.
 const RESIZE_GRAB: f32 = 4.0;
 
+/// Clamped range for the app-owned panel widths (drag and persisted restore).
+const PANEL_MIN_WIDTH: f32 = 160.0;
+const PANEL_MAX_WIDTH: f32 = 2000.0;
+
 fn install_fonts(ctx: &egui::Context) {
     let installed = ctx.data(|d| d.get_temp::<bool>(egui::Id::new("selva_fonts")) == Some(true));
     if installed {
@@ -41,10 +45,15 @@ fn install_fonts(ctx: &egui::Context) {
         "selva-bold".to_owned(),
         egui::FontData::from_static(include_bytes!("assets/Ubuntu-Bold.ttf")),
     );
-    fonts.families.insert(
-        egui::FontFamily::Name("selva-bold".into()),
-        vec!["selva-bold".to_owned()],
-    );
+    // Keep the default fallback chain after the bold font so glyphs it lacks
+    // (emoji, symbols) still render instead of showing tofu.
+    let mut bold = vec!["selva-bold".to_owned()];
+    if let Some(default_fallbacks) = fonts.families.get(&egui::FontFamily::Proportional).cloned() {
+        bold.extend(default_fallbacks);
+    }
+    fonts
+        .families
+        .insert(egui::FontFamily::Name("selva-bold".into()), bold);
     ctx.set_fonts(fonts);
     ctx.data_mut(|d| d.insert_temp(egui::Id::new("selva_fonts"), true));
 }
@@ -60,15 +69,20 @@ fn folder_label(name: impl Into<String>) -> egui::RichText {
         .strong()
 }
 
-fn matching_folders(node: &FileNode, root: &Path, query: &str, out: &mut Vec<PathBuf>) {
+/// Collect folders whose vault-relative path contains `query_lowercase`.
+fn matching_folders(node: &FileNode, root: &Path, query_lowercase: &str, out: &mut Vec<PathBuf>) {
     if let Some(children) = &node.children {
         for child in children {
             if child.is_dir {
                 let relative = child.path.strip_prefix(root).unwrap_or(&child.path);
-                if relative.to_string_lossy().to_lowercase().contains(query) {
+                if relative
+                    .to_string_lossy()
+                    .to_lowercase()
+                    .contains(query_lowercase)
+                {
                     out.push(child.path.clone());
                 }
-                matching_folders(child, root, query, out);
+                matching_folders(child, root, query_lowercase, out);
             }
         }
     }
@@ -919,8 +933,8 @@ impl NotesApp {
                 ("preview_width", &mut app.preview_width),
             ] {
                 if let Some(saved) = eframe::get_value::<f32>(storage, key) {
-                    if saved.is_finite() && (64.0..=2000.0).contains(&saved) {
-                        *width = saved;
+                    if saved.is_finite() {
+                        *width = saved.clamp(PANEL_MIN_WIDTH, PANEL_MAX_WIDTH);
                     }
                 }
             }
@@ -1160,6 +1174,8 @@ impl NotesApp {
                 }
                 Ok(ScanMessage::Tree(tree)) => {
                     self.file_tree = tree;
+                    // Folder search results derive from the tree.
+                    self.indexed_query = None;
                     ctx.request_repaint();
                 }
                 Ok(ScanMessage::Ready(index)) => {
@@ -2115,7 +2131,11 @@ impl NotesApp {
                             );
                             self.indexed_query = Some(query);
                         }
-                        ui.small(format!("{} folders", self.search_results.len()));
+                        ui.small(format!(
+                            "{} folder{}",
+                            self.search_results.len(),
+                            if self.search_results.len() == 1 { "" } else { "s" }
+                        ));
                         egui::ScrollArea::vertical()
                             .id_source("search_results")
                             .show_rows(ui, 26.0, self.search_results.len(), |ui, range| {
@@ -3369,11 +3389,13 @@ impl NotesApp {
                         "sidebar" => &mut self.sidebar_width,
                         "connections" => &mut self.connections_width,
                         "outline" => &mut self.outline_width,
-                        _ => &mut self.preview_width,
+                        "preview" => &mut self.preview_width,
+                        // Unknown edge: never silently resize the wrong panel.
+                        _ => continue,
                     };
                     // The sidebar grows rightwards, the right panels leftwards.
                     let sign = if *name == "sidebar" { 1.0 } else { -1.0 };
-                    *width = (*width + sign * delta).clamp(160.0, 2000.0);
+                    *width = (*width + sign * delta).clamp(PANEL_MIN_WIDTH, PANEL_MAX_WIDTH);
                 }
             }
         }
@@ -4473,7 +4495,7 @@ mod tests {
             .collect();
         assert!(texts.iter().any(|t| t == "Progetti Rossi"));
         assert!(!texts.iter().any(|t| t == "Progetti segreti.md"));
-        assert!(texts.iter().any(|t| t == "1 folders"));
+        assert!(texts.iter().any(|t| t == "1 folder"));
 
         // Clicking a folder result clears the filter and reveals it in the tree.
         let output = pointer_frame(&mut app, &ctx, vec![]);
