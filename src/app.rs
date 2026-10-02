@@ -23,6 +23,7 @@ enum FileAction {
     CreateNote(PathBuf),
     CreateFolder(PathBuf),
     ShowInFileManager(PathBuf),
+    Rename(PathBuf),
 }
 
 fn file_context_menu(ui: &mut egui::Ui, path: &Path, is_dir: bool, action: &mut FileAction) {
@@ -48,6 +49,12 @@ fn file_context_menu(ui: &mut egui::Ui, path: &Path, is_dir: bool, action: &mut 
     } else if ui.button("Move to trash").clicked() {
         *action = FileAction::Delete(path.to_path_buf());
         ui.close_menu();
+    }
+    if !is_dir {
+        if ui.button("Rename").clicked() {
+            *action = FileAction::Rename(path.to_path_buf());
+            ui.close_menu();
+        }
     }
 }
 
@@ -117,6 +124,22 @@ pub struct NotesApp {
     create_folder_target: Option<PathBuf>,
     new_folder_name: String,
     folder_error: String,
+    open_tabs: Vec<PathBuf>,
+    active_tab: Option<usize>,
+    command_palette_open: bool,
+    command_palette_query: String,
+    command_palette_selected: usize,
+    switcher_open: bool,
+    switcher_query: String,
+    switcher_selected: usize,
+    tags: Vec<(String, Vec<PathBuf>)>,
+    active_tag: Option<String>,
+    show_tags: bool,
+    show_outline: bool,
+    starred: HashSet<PathBuf>,
+    is_renaming: bool,
+    rename_target: Option<PathBuf>,
+    rename_name: String,
 }
 
 struct FileNode {
@@ -427,6 +450,71 @@ fn empty_tree(path: PathBuf) -> FileNode {
     }
 }
 
+fn extract_tags(text: &str) -> Vec<String> {
+    let mut tags = Vec::new();
+    let mut in_code_block = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") {
+            in_code_block = !in_code_block;
+            continue;
+        }
+        if in_code_block {
+            continue;
+        }
+        // Skip headings (lines starting with # after optional whitespace)
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        let mut chars = trimmed.char_indices().peekable();
+        while let Some((i, ch)) = chars.next() {
+            if ch == '`' {
+                // Skip inline code
+                if let Some(end) = trimmed[i + 1..].find('`') {
+                    for _ in 0..=end {
+                        chars.next();
+                    }
+                    continue;
+                }
+            }
+            if ch == '#' && (i == 0 || !trimmed.as_bytes()[i - 1].is_ascii_alphanumeric()) {
+                let rest = &trimmed[i + 1..];
+                let tag: String = rest
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
+                    .collect();
+                if !tag.is_empty() && !tags.contains(&tag) {
+                    tags.push(tag);
+                }
+            }
+        }
+    }
+    tags
+}
+
+fn extract_headings(text: &str) -> Vec<(usize, String)> {
+    let mut headings = Vec::new();
+    let mut in_code_block = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") {
+            in_code_block = !in_code_block;
+            continue;
+        }
+        if in_code_block {
+            continue;
+        }
+        let level = trimmed.chars().take_while(|&c| c == '#').count();
+        if level >= 1 && level <= 6 && trimmed.as_bytes().get(level) == Some(&b' ') {
+            let heading_text = trimmed[level..].trim().to_string();
+            if !heading_text.is_empty() {
+                headings.push((level, heading_text));
+            }
+        }
+    }
+    headings
+}
+
 fn tree_rows<'a>(node: &'a FileNode, expanded: &HashSet<PathBuf>, rows: &mut Vec<&'a FileNode>) {
     if let Some(children) = &node.children {
         for child in children {
@@ -445,13 +533,84 @@ fn apply_theme(ctx: &egui::Context, light: bool) {
         egui::Visuals::dark()
     };
     if !light {
-        visuals.panel_fill = egui::Color32::from_rgb(27, 28, 32);
-        visuals.window_fill = egui::Color32::from_rgb(32, 33, 38);
-        visuals.extreme_bg_color = egui::Color32::from_rgb(23, 24, 28);
-        visuals.override_text_color = Some(egui::Color32::from_rgb(220, 222, 227));
-        visuals.selection.bg_fill = egui::Color32::from_rgb(58, 69, 97);
-        visuals.hyperlink_color = egui::Color32::from_rgb(166, 187, 238);
+        // Catppuccin Mocha-inspired palette
+        let base = egui::Color32::from_rgb(30, 30, 46);       // #1e1e2e
+        let mantle = egui::Color32::from_rgb(24, 24, 37);     // #181825
+        let crust = egui::Color32::from_rgb(17, 17, 27);      // #11111b
+        let surface0 = egui::Color32::from_rgb(49, 50, 68);   // #313244
+        let surface1 = egui::Color32::from_rgb(69, 71, 90);   // #45475a
+        let overlay0 = egui::Color32::from_rgb(108, 112, 134);// #6c7086
+        let text = egui::Color32::from_rgb(205, 214, 244);    // #cdd6f4
+        let mauve = egui::Color32::from_rgb(137, 180, 250);   // #89b4fa
+
+        visuals.panel_fill = base;
+        visuals.window_fill = surface0;
+        visuals.extreme_bg_color = crust;
+        visuals.faint_bg_color = mantle;
+        visuals.override_text_color = Some(text);
+        visuals.selection.bg_fill = egui::Color32::from_rgb(88, 91, 112); // subtle highlight
+        visuals.selection.stroke = egui::Stroke::new(1.0_f32, mauve);
+        visuals.hyperlink_color = mauve;
+        visuals.warn_fg_color = egui::Color32::from_rgb(249, 226, 175); // #f9e2af
+        visuals.error_fg_color = egui::Color32::from_rgb(243, 139, 168); // #f38ba8
+        visuals.window_stroke = egui::Stroke::new(1.0_f32, surface1);
+        visuals.widgets.noninteractive.bg_fill = base;
+        visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0_f32, overlay0);
+        visuals.widgets.inactive.bg_fill = base;
+        visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(166, 173, 200));
+        visuals.widgets.inactive.weak_bg_fill = base;
+        visuals.widgets.hovered.bg_fill = surface0;
+        visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0_f32, text);
+        visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, surface1);
+        visuals.widgets.active.bg_fill = surface1;
+        visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0_f32, text);
+        visuals.widgets.open.bg_fill = surface0;
+        visuals.widgets.open.fg_stroke = egui::Stroke::new(1.0_f32, text);
+        visuals.striped = false;
+        visuals.interact_cursor = Some(egui::CursorIcon::PointingHand);
+    } else {
+        // Refined warm light theme — soft parchment tones
+        let bg = egui::Color32::from_rgb(252, 250, 245);           // warm ivory
+        let panel = egui::Color32::from_rgb(247, 244, 238);       // soft linen
+        let surface = egui::Color32::from_rgb(235, 231, 223);     // muted sand
+        let surface1 = egui::Color32::from_rgb(225, 221, 212);    // deeper sand
+        let overlay = egui::Color32::from_rgb(160, 152, 142);     // warm gray
+        let accent = egui::Color32::from_rgb(120, 100, 170);      // muted lavender
+        let text = egui::Color32::from_rgb(55, 50, 48);           // warm charcoal
+        let sidebar = egui::Color32::from_rgb(244, 241, 234);     // distinct sidebar
+        visuals.panel_fill = bg;
+        visuals.window_fill = panel;
+        visuals.extreme_bg_color = sidebar;
+        visuals.faint_bg_color = egui::Color32::from_rgb(249, 246, 240);
+        visuals.override_text_color = Some(text);
+        visuals.selection.bg_fill = egui::Color32::from_rgb(210, 205, 235);
+        visuals.selection.stroke = egui::Stroke::new(1.0_f32, accent);
+        visuals.hyperlink_color = accent;
+        visuals.warn_fg_color = egui::Color32::from_rgb(200, 150, 50);
+        visuals.error_fg_color = egui::Color32::from_rgb(190, 70, 80);
+        visuals.window_stroke = egui::Stroke::new(1.0_f32, surface);
+        visuals.widgets.noninteractive.bg_fill = bg;
+        visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0_f32, overlay);
+        visuals.widgets.inactive.bg_fill = bg;
+        visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(120, 115, 108));
+        visuals.widgets.inactive.weak_bg_fill = panel;
+        visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(240, 236, 228);
+        visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0_f32, text);
+        visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, surface1);
+        visuals.widgets.active.bg_fill = surface;
+        visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0_f32, text);
+        visuals.widgets.open.bg_fill = surface;
+        visuals.widgets.open.fg_stroke = egui::Stroke::new(1.0_f32, text);
+        visuals.striped = false;
     }
+    visuals.window_rounding = egui::Rounding::same(8.0);
+    visuals.menu_rounding = egui::Rounding::same(8.0);
+    visuals.popup_shadow = egui::epaint::Shadow {
+        offset: egui::Vec2::new(0.0, 4.0),
+        blur: 12.0,
+        spread: 0.0,
+        color: egui::Color32::from_black_alpha(60),
+    };
     ctx.set_visuals(visuals);
 }
 
@@ -482,14 +641,26 @@ impl NotesApp {
             .unwrap_or(false);
         apply_theme(&cc.egui_ctx, light_theme);
         let mut style = (*cc.egui_ctx.style()).clone();
-        style.spacing.item_spacing = egui::vec2(8.0, 8.0);
-        style.spacing.button_padding = egui::vec2(8.0, 6.0);
+        style.spacing.item_spacing = egui::vec2(6.0, 6.0);
+        style.spacing.button_padding = egui::vec2(10.0, 5.0);
+        style.spacing.indent = 18.0;
+        style.spacing.scroll = egui::style::ScrollStyle::thin();
         style
             .text_styles
-            .insert(egui::TextStyle::Body, egui::FontId::proportional(16.0));
+            .insert(egui::TextStyle::Body, egui::FontId::proportional(15.0));
         style
             .text_styles
-            .insert(egui::TextStyle::Button, egui::FontId::proportional(14.0));
+            .insert(egui::TextStyle::Button, egui::FontId::proportional(13.5));
+        style
+            .text_styles
+            .insert(egui::TextStyle::Small, egui::FontId::proportional(12.0));
+        style
+            .text_styles
+            .insert(egui::TextStyle::Heading, egui::FontId::proportional(19.0));
+        style.visuals.widgets.noninteractive.rounding = egui::Rounding::same(4.0);
+        style.visuals.widgets.inactive.rounding = egui::Rounding::same(4.0);
+        style.visuals.widgets.hovered.rounding = egui::Rounding::same(4.0);
+        style.visuals.widgets.active.rounding = egui::Rounding::same(4.0);
         cc.egui_ctx.set_style(style);
         let notes = Vec::new();
         let mut app = Self {
@@ -524,8 +695,33 @@ impl NotesApp {
             create_folder_target: None,
             new_folder_name: String::new(),
             folder_error: String::new(),
+            open_tabs: Vec::new(),
+            active_tab: None,
+            command_palette_open: false,
+            command_palette_query: String::new(),
+            command_palette_selected: 0,
+            switcher_open: false,
+            switcher_query: String::new(),
+            switcher_selected: 0,
+            tags: Vec::new(),
+            active_tag: None,
+            show_tags: true,
+            show_outline: false,
+            starred: HashSet::new(),
+            is_renaming: false,
+            rename_target: None,
+            rename_name: String::new(),
         };
         if let Some(storage) = cc.storage {
+            if let Some(saved) = eframe::get_value::<HashSet<PathBuf>>(storage, "starred") {
+                app.starred = saved;
+            }
+            if let Some(tabs) = eframe::get_value::<Vec<PathBuf>>(storage, "open_tabs") {
+                app.open_tabs = tabs;
+            }
+            if let Some(active) = eframe::get_value::<Option<usize>>(storage, "active_tab") {
+                app.active_tab = active;
+            }
             if let Some(path) =
                 eframe::get_value::<Option<PathBuf>>(storage, "current_file").flatten()
             {
@@ -601,6 +797,14 @@ impl NotesApp {
             }
             Err(e) => self.status = format!("Could not read file: {e}"),
         }
+        // Manage tabs
+        let path_buf = path.to_path_buf();
+        if let Some(idx) = self.open_tabs.iter().position(|p| p == &path_buf) {
+            self.active_tab = Some(idx);
+        } else {
+            self.open_tabs.push(path_buf);
+            self.active_tab = Some(self.open_tabs.len() - 1);
+        }
     }
 
     fn save_current_file(&mut self) -> bool {
@@ -670,6 +874,7 @@ impl NotesApp {
                     self.scan = None;
                     self.indexed_query = None;
                     self.refresh_backlinks();
+                    self.refresh_tags();
                     self.status = format!(
                         "{} notes · {}",
                         self.notes.len(),
@@ -721,6 +926,97 @@ impl NotesApp {
         }
     }
 
+    fn refresh_tags(&mut self) {
+        let mut tag_map: std::collections::HashMap<String, Vec<PathBuf>> =
+            std::collections::HashMap::new();
+        for (path, text) in &self.notes {
+            for tag in extract_tags(text) {
+                tag_map.entry(tag).or_default().push(path.clone());
+            }
+        }
+        let mut tags: Vec<(String, Vec<PathBuf>)> = tag_map.into_iter().collect();
+        tags.sort_by(|a, b| a.0.cmp(&b.0));
+        self.tags = tags;
+    }
+
+    fn update_wiki_links(&mut self, old_name: &str, new_name: &str) {
+        // Update wiki-links in all notes that reference the old name
+        for (path, text) in &mut self.notes {
+            if !text.contains(old_name) {
+                continue;
+            }
+            let links = wiki_links(text);
+            if !links.iter().any(|link| link.eq_ignore_ascii_case(old_name)) {
+                continue;
+            }
+            // Replace [[old_name]] with [[new_name]] (preserving case patterns)
+            let updated = text.clone();
+            // Find and replace wiki-link references
+            let mut result = String::new();
+            let mut remaining = updated.as_str();
+            while let Some(start) = remaining.find("[[") {
+                result.push_str(&remaining[..start]);
+                if let Some(end) = remaining[start..].find("]]") {
+                    let link_content = &remaining[start + 2..start + end];
+                    // Check if this link targets the old name (before the pipe or hash)
+                    let target = link_content
+                        .split('|').next().unwrap_or("")
+                        .split('#').next().unwrap_or("")
+                        .trim();
+                    if target.eq_ignore_ascii_case(old_name) {
+                        // Replace the target part while preserving alias/heading
+                        let rest = &link_content[target.len()..];
+                        result.push_str(&format!("[[{}{}]]", new_name, rest));
+                    } else {
+                        result.push_str(&remaining[start..start + end + 2]);
+                    }
+                    remaining = &remaining[start + end + 2..];
+                } else {
+                    result.push_str(&remaining[start..]);
+                    remaining = "";
+                }
+            }
+            result.push_str(remaining);
+            if result != *text {
+                if let Err(e) = fs::write(path.as_path(), &result) {
+                    self.status = format!("Could not update links in {}: {e}", path.display());
+                } else {
+                    *text = result;
+                }
+            }
+        }
+    }
+
+    fn insert_at_cursor(&mut self, text: &str, output: &egui::text_edit::TextEditOutput) {
+        if let Some(cursor_range) = output.cursor_range {
+            let min = cursor_range
+                .primary
+                .ccursor
+                .index
+                .min(cursor_range.secondary.ccursor.index);
+            let max = cursor_range
+                .primary
+                .ccursor
+                .index
+                .max(cursor_range.secondary.ccursor.index);
+            let byte_min = self
+                .editor_text
+                .char_indices()
+                .nth(min)
+                .map(|(i, _)| i)
+                .unwrap_or(self.editor_text.len());
+            let byte_max = self
+                .editor_text
+                .char_indices()
+                .nth(max)
+                .map(|(i, _)| i)
+                .unwrap_or(self.editor_text.len());
+            self.editor_text.replace_range(byte_min..byte_max, text);
+        } else {
+            self.editor_text.push_str(text);
+        }
+    }
+
     fn choose_vault(&mut self) {
         if !self.save_current_file() {
             return;
@@ -747,6 +1043,9 @@ impl NotesApp {
             self.search.clear();
             self.search_results.clear();
             self.indexed_query = None;
+            self.tags.clear();
+            self.active_tag = None;
+            self.show_outline = false;
             self.file_tree = empty_tree(self.workspace_dir.clone());
             self.refresh();
         }
@@ -817,6 +1116,45 @@ impl NotesApp {
             Err(e) => self.status = format!("Could not create note: {e}"),
         }
     }
+
+    fn close_tab(&mut self, index: usize) {
+        if index >= self.open_tabs.len() {
+            return;
+        }
+        self.open_tabs.remove(index);
+        if self.open_tabs.is_empty() {
+            self.active_tab = None;
+            self.current_file_path = None;
+            self.image_view = None;
+            self.editor_text.clear();
+            self.saved_text.clear();
+            self.last_edit = None;
+        } else {
+            let new_active = if let Some(active) = self.active_tab {
+                if active >= self.open_tabs.len() {
+                    Some(self.open_tabs.len() - 1)
+                } else if active > index {
+                    Some(active - 1)
+                } else {
+                    Some(active)
+                }
+            } else {
+                Some(0)
+            };
+            self.active_tab = new_active;
+            if let Some(idx) = new_active {
+                let path = self.open_tabs[idx].clone();
+                self.open_file(&path);
+            }
+        }
+    }
+
+    fn switch_to_tab(&mut self, index: usize) {
+        if index < self.open_tabs.len() {
+            let path = self.open_tabs[index].clone();
+            self.open_file(&path);
+        }
+    }
 }
 
 impl Drop for NotesApp {
@@ -832,6 +1170,9 @@ impl eframe::App for NotesApp {
         eframe::set_value(storage, "current_file", &self.current_file_path);
         eframe::set_value(storage, "workspace_dir", &self.workspace_dir);
         eframe::set_value(storage, "display_mode", &self.display_mode);
+        eframe::set_value(storage, "open_tabs", &self.open_tabs);
+        eframe::set_value(storage, "active_tab", &self.active_tab);
+        eframe::set_value(storage, "starred", &self.starred);
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -857,23 +1198,90 @@ impl NotesApp {
             self.new_note_name.clear();
             self.create_note_target_dir = None;
         }
+        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::P)) {
+            self.command_palette_open = true;
+            self.command_palette_query.clear();
+            self.command_palette_selected = 0;
+        }
+        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::O)) {
+            self.switcher_open = true;
+            self.switcher_query.clear();
+            self.switcher_selected = 0;
+        }
+        // Ctrl+W close active tab
+        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::W)) {
+            if let Some(idx) = self.active_tab {
+                self.close_tab(idx);
+            }
+        }
+        // Ctrl+Tab / Ctrl+Shift+Tab for next/prev tab
+        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Tab)) {
+            if let Some(active) = self.active_tab {
+                if ctx.input(|i| i.modifiers.shift) {
+                    // Previous tab
+                    if active > 0 {
+                        self.switch_to_tab(active - 1);
+                    } else if !self.open_tabs.is_empty() {
+                        self.switch_to_tab(self.open_tabs.len() - 1);
+                    }
+                } else {
+                    // Next tab
+                    if active + 1 < self.open_tabs.len() {
+                        self.switch_to_tab(active + 1);
+                    } else if !self.open_tabs.is_empty() {
+                        self.switch_to_tab(0);
+                    }
+                }
+            }
+        }
+        // Ctrl+D: toggle star on current note
+        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::D)) {
+            if let Some(path) = self.current_file_path.clone() {
+                if !self.starred.remove(&path) {
+                    self.starred.insert(path);
+                }
+            }
+        }
+        // Ctrl+Shift+O: toggle outline panel
+        if ctx.input(|i| i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::O)) {
+            self.show_outline = !self.show_outline;
+        }
         if ctx.input(|i| i.viewport().close_requested()) && !self.save_current_file() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
-        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.small(&self.status);
-                ui.separator();
-                ui.small(format!(
-                    "{} words · {} characters",
-                    self.editor_text.split_whitespace().count(),
-                    self.editor_text.chars().count()
-                ));
-                if self.editor_text != self.saved_text {
-                    ui.colored_label(egui::Color32::LIGHT_RED, "Unsaved changes");
-                }
+        egui::TopBottomPanel::bottom("status")
+            .exact_height(22.0)
+            .show(ctx, |ui| {
+                ui.horizontal_centered(|ui| {
+                    ui.spacing_mut().item_spacing.x = 12.0;
+                    let status_text = egui::RichText::new(&self.status)
+                        .size(11.5)
+                        .color(ui.visuals().widgets.noninteractive.fg_stroke.color);
+                    ui.label(status_text);
+                    // Word/char count
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} words · {} chars",
+                            self.editor_text.split_whitespace().count(),
+                            self.editor_text.chars().count()
+                        ))
+                        .size(11.5)
+                        .color(ui.visuals().widgets.noninteractive.fg_stroke.color),
+                    );
+                    if self.editor_text != self.saved_text {
+                        ui.label(
+                            egui::RichText::new("●")
+                                .size(14.0)
+                                .color(egui::Color32::from_rgb(249, 226, 175)),
+                        );
+                        ui.label(
+                            egui::RichText::new("Unsaved")
+                                .size(11.5)
+                                .color(egui::Color32::from_rgb(249, 226, 175)),
+                        );
+                    }
+                });
             });
-        });
         let mut action = FileAction::None;
 
         egui::SidePanel::left("vault_sidebar_v2")
@@ -881,11 +1289,11 @@ impl NotesApp {
             .default_width(250.0)
             .width_range(200.0..=360.0)
             .show(ctx, |ui| {
-                ui.add_space(6.0);
+                ui.add_space(4.0);
                 ui.scope(|ui| {
-                    ui.spacing_mut().item_spacing = egui::vec2(6.0, 8.0);
-                    ui.spacing_mut().button_padding = egui::vec2(8.0, 6.0);
-                    // A compact vault header; secondary actions stay in its menu.
+                    ui.spacing_mut().item_spacing = egui::vec2(4.0, 6.0);
+                    ui.spacing_mut().button_padding = egui::vec2(8.0, 5.0);
+                    // Vault header — name + actions
                     ui.horizontal(|ui| {
                         let name = self
                             .workspace_dir
@@ -893,18 +1301,18 @@ impl NotesApp {
                             .unwrap_or_default()
                             .to_string_lossy()
                             .into_owned();
-                        let short = if name.chars().count() > 18 {
-                            format!("{}…", name.chars().take(17).collect::<String>())
+                        let short = if name.chars().count() > 20 {
+                            format!("{}…", name.chars().take(19).collect::<String>())
                         } else {
                             name.clone()
                         };
-                        let width = (ui.available_width() - 38.0).max(100.0);
+                        let width = (ui.available_width() - 32.0).max(100.0);
                         ui.allocate_ui_with_layout(
-                            egui::vec2(width, 30.0),
+                            egui::vec2(width, 28.0),
                             egui::Layout::left_to_right(egui::Align::Center),
                             |ui| {
                                 ui.menu_button(
-                                    egui::RichText::new(short).size(17.0).strong(),
+                                    egui::RichText::new(short).size(14.0).strong(),
                                     |ui| {
                                         ui.set_min_width(190.0);
                                         ui.weak("VAULT");
@@ -974,8 +1382,8 @@ impl NotesApp {
                         );
                         if ui
                             .add_sized(
-                                [30.0, 30.0],
-                                egui::Button::new(egui::RichText::new("+").size(21.0)).frame(false),
+                                [28.0, 28.0],
+                                egui::Button::new(egui::RichText::new("+").size(18.0)).frame(false),
                             )
                             .on_hover_text("New note · Ctrl+N")
                             .clicked()
@@ -985,13 +1393,14 @@ impl NotesApp {
                             self.create_note_target_dir = None;
                         }
                     });
+                    // Search bar
                     egui::Frame::none()
                         .fill(ui.visuals().extreme_bg_color)
                         .rounding(6.0)
                         .inner_margin(egui::Margin::symmetric(8.0, 5.0))
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
-                                let width = (ui.available_width() - 28.0).max(60.0);
+                                let width = (ui.available_width() - 24.0).max(60.0);
                                 let search = ui.add(
                                     egui::TextEdit::singleline(&mut self.search)
                                         .frame(false)
@@ -1033,16 +1442,17 @@ impl NotesApp {
                                 .on_hover_text("Search options");
                             });
                         });
+                    // Display mode toggle — clean segmented control
                     egui::Frame::none()
-                        .fill(ui.visuals().faint_bg_color)
+                        .fill(ui.visuals().extreme_bg_color)
                         .rounding(6.0)
-                        .inner_margin(3.0)
+                        .inner_margin(2.0)
                         .show(ui, |ui| {
-                            ui.spacing_mut().item_spacing.x = 2.0;
+                            ui.spacing_mut().item_spacing.x = 1.0;
                             ui.horizontal(|ui| {
                                 let wide = ctx.screen_rect().width() >= 1050.0;
                                 let count = if wide { 3.0 } else { 2.0 };
-                                let width = (ui.available_width() - (count - 1.0) * 2.0) / count;
+                                let width = (ui.available_width() - (count - 1.0) * 1.0) / count;
                                 for (mode, label) in [
                                     (DisplayMode::EditOnly, "Write"),
                                     (DisplayMode::ViewOnly, "Read"),
@@ -1054,7 +1464,7 @@ impl NotesApp {
                                     let selected = self.display_mode == mode;
                                     if ui
                                         .add_sized(
-                                            [width, 26.0],
+                                            [width, 24.0],
                                             egui::SelectableLabel::new(selected, label),
                                         )
                                         .clicked()
@@ -1064,7 +1474,7 @@ impl NotesApp {
                                 }
                             });
                         });
-                    ui.add_space(3.0);
+                    ui.add_space(2.0);
                 });
                 ui.separator();
                 if self.scan.is_some() {
@@ -1077,12 +1487,83 @@ impl NotesApp {
                         });
                     });
                 }
+                if !self.starred.is_empty() && self.search.trim().is_empty() {
+                    let _ = ui.selectable_label(false,
+                        egui::RichText::new("STARRED").size(11.0)
+                            .color(ui.visuals().widgets.noninteractive.fg_stroke.color),
+                    );
+                    let mut starred_paths: Vec<PathBuf> = self.starred.iter().cloned().collect();
+                    starred_paths.sort();
+                    starred_paths.truncate(10);
+                    let current = self.current_file_path.clone();
+                    let mut unstar: Option<PathBuf> = None;
+                    for path in &starred_paths {
+                        let name = path.file_name().unwrap_or_default().to_string_lossy();
+                        ui.horizontal(|ui| {
+                            ui.add_space(8.0);
+                            let star_btn = ui.add_sized(
+                                egui::vec2(16.0, 20.0),
+                                egui::Button::new(egui::RichText::new("★").size(12.0)
+                                    .color(egui::Color32::from_rgb(230, 190, 60)))
+                                    .frame(false),
+                            );
+                            if star_btn.clicked() {
+                                unstar = Some(path.clone());
+                            }
+                            let label_text = name.into_owned();
+                            let response = ui.add(egui::SelectableLabel::new(
+                                current.as_ref() == Some(path),
+                                egui::RichText::new(label_text).size(13.0),
+                            ));
+                            if response.clicked() {
+                                action = FileAction::Open(path.clone());
+                            }
+                        });
+                    }
+                    if let Some(p) = unstar {
+                        self.starred.remove(&p);
+                    }
+                    ui.add_space(2.0);
+                    ui.separator();
+                }
                 if self.search.trim().is_empty() {
+                    // If a tag is active, show filtered list instead of full tree
+                    if let Some(active) = &self.active_tag {
+                        let tag_paths: Vec<PathBuf> = self.tags.iter()
+                            .find(|(name, _)| name == active)
+                            .map(|(_, paths)| paths.clone())
+                            .unwrap_or_default();
+                        ui.small(format!("{} notes with #{}", tag_paths.len(), active));
+                        let current = self.current_file_path.clone();
+                        egui::ScrollArea::vertical()
+                            .id_source("tag_filtered")
+                            .show_rows(ui, 26.0, tag_paths.len(), |ui, range| {
+                                for index in range {
+                                    let path = &tag_paths[index];
+                                    let name = path.strip_prefix(&self.workspace_dir)
+                                        .unwrap_or(path)
+                                        .display()
+                                        .to_string();
+                                    let response = ui.add(egui::SelectableLabel::new(
+                                        current.as_ref() == Some(path),
+                                        name,
+                                    ));
+                                    if response.clicked() {
+                                        action = FileAction::Open(path.clone());
+                                    }
+                                    response.context_menu(|ui| {
+                                        file_context_menu(ui, path, false, &mut action);
+                                    });
+                                }
+                            });
+                    } else {
                     let mut rows = Vec::new();
                     tree_rows(&self.file_tree, &self.expanded, &mut rows);
+                    let mut needs_refresh = false;
                     egui::ScrollArea::vertical()
                         .id_source("vault_files")
                         .auto_shrink([false, false])
+                        .drag_to_scroll(false)
                         .show_rows(ui, 26.0, rows.len(), |ui, range| {
                             for index in range {
                                 let node = rows[index];
@@ -1122,12 +1603,131 @@ impl NotesApp {
                                         ));
                                     }
                                     let label = name.into_owned();
+                                    let is_starred = !node.is_dir && self.starred.contains(&node.path);
+                                    // Bold folder names, regular file names
+                                    let label_text = if node.is_dir {
+                                        egui::RichText::new(label).strong()
+                                    } else {
+                                        egui::RichText::new(label)
+                                    };
                                     let response = ui
                                         .add(egui::SelectableLabel::new(
                                             self.current_file_path.as_ref() == Some(&node.path),
-                                            label,
+                                            label_text,
                                         ))
                                         .on_hover_text(node.path.display().to_string());
+                                    // Drag & drop: files are draggable, folders are drop targets.
+                                    // Extend the row's own sense via `Response::interact` instead of
+                                    // overlaying `ui.interact` on the same rect: a second widget would
+                                    // win the click hit-test and `response.clicked()` would never fire,
+                                    // making notes unselectable.
+                                    if !node.is_dir {
+                                        let drag_response =
+                                            response.interact(egui::Sense::click_and_drag());
+                                        if drag_response.drag_started() {
+                                            ui.ctx().memory_mut(|mem| {
+                                                mem.data.insert_temp(
+                                                    egui::Id::new("dnd_source"),
+                                                    node.path.clone(),
+                                                )
+                                            });
+                                        }
+                                    }
+                                    // Drop target for folders
+                                    if node.is_dir {
+                                        let has_drag = ui.ctx().memory(|mem| {
+                                            mem.data
+                                                .get_temp::<PathBuf>(egui::Id::new("dnd_source"))
+                                                .is_some()
+                                        });
+                                        // `Response::hovered()` is suppressed while dragging (only the
+                                        // dragged widget counts as hovered), so test the pointer
+                                        // position against the row rect instead: this keeps the drop
+                                        // target highlighted for the whole drag.
+                                        let pointer_over = ui.ctx().input(|i| {
+                                            i.pointer
+                                                .interact_pos()
+                                                .map_or(false, |pos| response.rect.contains(pos))
+                                        });
+                                        if has_drag && pointer_over {
+                                            // Highlight drop target
+                                            let rect = response.rect;
+                                            ui.painter().rect_filled(
+                                                rect,
+                                                egui::Rounding::same(4.0),
+                                                ui.visuals().selection.bg_fill,
+                                            );
+                                            ui.painter().rect_stroke(
+                                                rect,
+                                                egui::Rounding::same(4.0),
+                                                egui::Stroke::new(
+                                                    2.0_f32,
+                                                    ui.visuals().selection.stroke.color,
+                                                ),
+                                            );
+                                            // Perform drop if pointer released
+                                            if ui.ctx().input(|i| i.pointer.any_released()) {
+                                                if let Some(src_path) = ui
+                                                    .ctx()
+                                                    .memory(|mem| {
+                                                        mem.data.get_temp::<PathBuf>(egui::Id::new(
+                                                            "dnd_source",
+                                                        ))
+                                                    })
+                                                {
+                                                    let file_name = src_path
+                                                        .file_name()
+                                                        .unwrap_or_default();
+                                                    let dest = node.path.join(file_name);
+                                                    if !dest.exists() {
+                                                        if let Err(e) = fs::rename(&src_path, &dest)
+                                                        {
+                                                            self.status = format!(
+                                                                "Could not move: {e}"
+                                                            );
+                                                        } else {
+                                                            if self.current_file_path.as_ref()
+                                                                == Some(&src_path)
+                                                            {
+                                                                self.current_file_path =
+                                                                    Some(dest);
+                                                            }
+                                                            needs_refresh = true;
+                                                            self.status =
+                                                                "File moved.".into();
+                                                        }
+                                                    }
+                                                    ui.ctx().memory_mut(|mem| {
+                                                        mem.data
+                                                            .remove::<PathBuf>(egui::Id::new(
+                                                                "dnd_source",
+                                                            ))
+                                                    });
+                                                }
+                                            }
+                                        }
+                                    }
+                                    // Star icon for files
+                                    if !node.is_dir {
+                                        let star_text = if is_starred {
+                                            egui::RichText::new("★").size(11.0)
+                                                .color(egui::Color32::from_rgb(230, 190, 60))
+                                        } else {
+                                            egui::RichText::new("☆").size(11.0)
+                                                .color(ui.visuals().widgets.noninteractive.fg_stroke.color)
+                                        };
+                                        let star_btn = ui.add_sized(
+                                            egui::vec2(14.0, 20.0),
+                                            egui::Button::new(star_text).frame(false),
+                                        );
+                                        if star_btn.clicked() {
+                                            if is_starred {
+                                                self.starred.remove(&node.path);
+                                            } else {
+                                                self.starred.insert(node.path.clone());
+                                            }
+                                        }
+                                    }
                                     if response.clicked()
                                         || (node.is_dir && icon_response.clicked())
                                     {
@@ -1145,9 +1745,21 @@ impl NotesApp {
                                 });
                             }
                         });
-                    if rows.is_empty() && self.scan.is_none() {
+                    // Clear drag state if pointer released without dropping on a folder
+                    if ui.ctx().input(|i| i.pointer.any_released()) {
+                        ui.ctx().memory_mut(|mem| {
+                            mem.data.remove::<PathBuf>(egui::Id::new("dnd_source"))
+                        });
+                    }
+                    let rows_empty = rows.is_empty();
+                    drop(rows);
+                    if needs_refresh {
+                        self.refresh();
+                    }
+                    if rows_empty && self.scan.is_none() {
                         ui.label("No files in this folder.");
                     }
+                    } // close tag filter else
                 } else {
                     let query = self.search.trim().to_lowercase();
                     if self.indexed_query.as_ref() != Some(&query) {
@@ -1189,14 +1801,69 @@ impl NotesApp {
                             }
                         });
                 }
+                // Tags section at the bottom of sidebar
+                if !self.tags.is_empty() {
+                    ui.separator();
+                    let tags_header = if self.show_tags { "▾ TAGS" } else { "▸ TAGS" };
+                    if ui.selectable_label(false,
+                        egui::RichText::new(tags_header).size(11.0)
+                            .color(ui.visuals().widgets.noninteractive.fg_stroke.color),
+                    ).clicked() {
+                        self.show_tags = !self.show_tags;
+                    }
+                    if self.show_tags {
+                        ui.add_space(2.0);
+                        let mut tag_clicked: Option<String> = None;
+                        for (tag_name, paths) in &self.tags {
+                            let is_active = self.active_tag.as_ref() == Some(tag_name);
+                            let pill_text = format!("{} ({})", tag_name, paths.len());
+                            let pill = egui::Button::new(
+                                egui::RichText::new(&pill_text).size(11.0),
+                            )
+                            .rounding(egui::Rounding::same(10.0))
+                            .fill(if is_active {
+                                ui.visuals().selection.bg_fill
+                            } else {
+                                ui.visuals().extreme_bg_color
+                            })
+                            .stroke(if is_active {
+                                egui::Stroke::new(1.0_f32, ui.visuals().selection.stroke.color)
+                            } else {
+                                egui::Stroke::NONE
+                            });
+                            if ui.add(pill).clicked() {
+                                tag_clicked = Some(tag_name.clone());
+                            }
+                        }
+                        if let Some(tag) = tag_clicked {
+                            if self.active_tag.as_ref() == Some(&tag) {
+                                self.active_tag = None;
+                            } else {
+                                self.active_tag = Some(tag);
+                            }
+                        }
+                    }
+                }
             });
         if let Some(parent) = self.create_folder_target.clone() {
             egui::Window::new("New folder")
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .title_bar(false)
                 .show(ctx, |ui| {
-                    ui.label(format!("Inside: {}", parent.display()));
+                    ui.label(
+                        egui::RichText::new("New folder")
+                            .size(15.0)
+                            .strong(),
+                    );
+                    ui.add_space(2.0);
+                    ui.label(
+                        egui::RichText::new(format!("Inside: {}", parent.display()))
+                            .size(12.0)
+                            .color(ui.visuals().widgets.noninteractive.fg_stroke.color),
+                    );
+                    ui.add_space(6.0);
                     let name = ui.add(
                         egui::TextEdit::singleline(&mut self.new_folder_name)
                             .hint_text("Folder name")
@@ -1208,8 +1875,9 @@ impl NotesApp {
                     if !self.folder_error.is_empty() {
                         ui.colored_label(ui.visuals().error_fg_color, &self.folder_error);
                     }
+                    ui.add_space(4.0);
                     ui.horizontal(|ui| {
-                        if ui.button("Create folder").clicked()
+                        if ui.button("Create").clicked()
                             || (name.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
                         {
                             self.create_folder();
@@ -1227,8 +1895,20 @@ impl NotesApp {
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .title_bar(false)
                 .show(ctx, |ui| {
-                    ui.label("Note title");
+                    ui.label(
+                        egui::RichText::new("New note")
+                            .size(15.0)
+                            .strong(),
+                    );
+                    ui.add_space(2.0);
+                    ui.label(
+                        egui::RichText::new("Note title")
+                            .size(12.0)
+                            .color(ui.visuals().widgets.noninteractive.fg_stroke.color),
+                    );
+                    ui.add_space(6.0);
                     let title = ui.add(
                         egui::TextEdit::singleline(&mut self.new_note_name)
                             .hint_text("An idea to remember")
@@ -1237,8 +1917,9 @@ impl NotesApp {
                     if !title.has_focus() && self.new_note_name.is_empty() {
                         title.request_focus();
                     }
+                    ui.add_space(4.0);
                     ui.horizontal(|ui| {
-                        if ui.button("Create note").clicked()
+                        if ui.button("Create").clicked()
                             || (title.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
                         {
                             self.create_note();
@@ -1251,6 +1932,84 @@ impl NotesApp {
                         }
                     });
                 });
+        }
+        if self.is_renaming {
+            if let Some(target) = self.rename_target.clone() {
+                let ext = target.extension().unwrap_or_default().to_string_lossy().into_owned();
+                egui::Window::new("Rename note")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                    .title_bar(false)
+                    .show(ctx, |ui| {
+                        ui.label(
+                            egui::RichText::new("Rename note")
+                                .size(15.0)
+                                .strong(),
+                        );
+                        ui.add_space(6.0);
+                        let name_input = ui.add(
+                            egui::TextEdit::singleline(&mut self.rename_name)
+                                .hint_text("New name")
+                                .desired_width(320.0),
+                        );
+                        if !name_input.has_focus() && self.rename_name.is_empty() {
+                            name_input.request_focus();
+                        }
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            let confirm = ui.button("Rename").clicked()
+                                || (name_input.has_focus()
+                                    && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                            if confirm && !self.rename_name.is_empty() && valid_note_name(&self.rename_name) {
+                                let new_name = if ext.is_empty() {
+                                    self.rename_name.clone()
+                                } else {
+                                    format!("{}.{}", self.rename_name, ext)
+                                };
+                                let new_path = target.parent().unwrap_or(&target).join(&new_name);
+                                if new_path.exists() {
+                                    self.status = "A file with that name already exists.".into();
+                                } else {
+                                    match fs::rename(&target, &new_path) {
+                                        Ok(()) => {
+                                            // Update wiki-links in all notes
+                                            let old_stem = target.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+                                            let new_stem = self.rename_name.clone();
+                                            if old_stem != new_stem {
+                                                self.update_wiki_links(&old_stem, &new_stem);
+                                            }
+                                            if self.current_file_path.as_ref() == Some(&target) {
+                                                self.current_file_path = Some(new_path.clone());
+                                            }
+                                            // Update open tabs
+                                            for tab in &mut self.open_tabs {
+                                                if *tab == target {
+                                                    *tab = new_path.clone();
+                                                }
+                                            }
+                                            self.is_renaming = false;
+                                            self.rename_target = None;
+                                            self.refresh();
+                                            self.status = format!("Renamed to {}", new_name);
+                                        }
+                                        Err(e) => {
+                                            self.status = format!("Could not rename: {e}");
+                                        }
+                                    }
+                                }
+                            }
+                            if ui.button("Cancel").clicked()
+                                || ui.input(|i| i.key_pressed(egui::Key::Escape))
+                            {
+                                self.is_renaming = false;
+                                self.rename_target = None;
+                            }
+                        });
+                    });
+            } else {
+                self.is_renaming = false;
+            }
         }
 
         match action {
@@ -1300,6 +2059,12 @@ impl NotesApp {
                 self.new_folder_name.clear();
                 self.folder_error.clear();
             }
+            FileAction::Rename(path) => {
+                let stem = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+                self.is_renaming = true;
+                self.rename_target = Some(path);
+                self.rename_name = stem;
+            }
             FileAction::None => {}
         }
 
@@ -1335,11 +2100,26 @@ impl NotesApp {
                 .default_width(220.0)
                 .width_range(180.0..=300.0)
                 .show(ctx, |ui| {
-                    ui.add_space(10.0);
-                    ui.heading("Connections");
-                    ui.small("Connect ideas with [[Note name]]");
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new("Connections")
+                            .size(14.0)
+                            .strong(),
+                    );
+                    ui.add_space(2.0);
+                    ui.label(
+                        egui::RichText::new("Connect ideas with [[Note name]]")
+                            .size(11.5)
+                            .color(ui.visuals().widgets.noninteractive.fg_stroke.color),
+                    );
+                    ui.add_space(4.0);
                     ui.separator();
-                    ui.label("OUTGOING LINKS");
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new("OUTGOING LINKS")
+                            .size(11.0)
+                            .color(ui.visuals().widgets.noninteractive.fg_stroke.color),
+                    );
                     let links = wiki_links(&self.editor_text);
                     if links.is_empty() {
                         ui.small("No links yet.");
@@ -1367,8 +2147,12 @@ impl NotesApp {
                             }
                         }
                     }
-                    ui.add_space(16.0);
-                    ui.label("BACKLINKS");
+                    ui.add_space(12.0);
+                    ui.label(
+                        egui::RichText::new("BACKLINKS")
+                            .size(11.0)
+                            .color(ui.visuals().widgets.noninteractive.fg_stroke.color),
+                    );
                     for path in &self.backlinks {
                         if ui
                             .link(
@@ -1395,6 +2179,51 @@ impl NotesApp {
             }
         }
 
+        // Outline/TOC panel on the right side
+        if self.show_outline && is_markdown && ctx.screen_rect().width() >= 1050.0 {
+            egui::SidePanel::right("outline_panel")
+                .default_width(200.0)
+                .width_range(160.0..=280.0)
+                .show(ctx, |ui| {
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new("Outline")
+                            .size(14.0)
+                            .strong(),
+                    );
+                    ui.add_space(4.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        let headings = extract_headings(&self.editor_text);
+                        if headings.is_empty() {
+                            ui.small("No headings found.");
+                        }
+                        for (level, text) in &headings {
+                            let indent = (*level - 1) as f32 * 12.0;
+                            ui.horizontal(|ui| {
+                                ui.add_space(indent);
+                                let size = match *level {
+                                    1 => 13.5,
+                                    2 => 12.5,
+                                    _ => 11.5,
+                                };
+                                let color = if *level <= 2 {
+                                    ui.visuals().text_color()
+                                } else {
+                                    ui.visuals().widgets.noninteractive.fg_stroke.color
+                                };
+                                ui.label(
+                                    egui::RichText::new(text)
+                                        .size(size)
+                                        .color(color),
+                                );
+                            });
+                        }
+                    });
+                });
+        }
+
         // Right panel for preview, ONLY in split mode
         let show_right_preview = is_markdown
             && self.display_mode == DisplayMode::EditAndPreview
@@ -1406,8 +2235,15 @@ impl NotesApp {
                 .default_width(360.0)
                 .width_range(250.0..=500.0)
                 .show(ctx, |ui| {
-                    ui.heading("Preview");
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new("Preview")
+                            .size(14.0)
+                            .strong(),
+                    );
+                    ui.add_space(2.0);
                     ui.separator();
+                    ui.add_space(2.0);
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         CommonMarkViewer::new("viewer").show(
                             ui,
@@ -1420,11 +2256,171 @@ impl NotesApp {
 
         // Central panel
         egui::CentralPanel::default().show(ctx, |ui| {
+            // Tab bar
+            if !self.open_tabs.is_empty() {
+                let tab_height = 30.0;
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), tab_height),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        egui::ScrollArea::horizontal()
+                            .id_source("tab_bar")
+                            .max_width(ui.available_width())
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    let mut close_idx: Option<usize> = None;
+                                    let mut switch_idx: Option<usize> = None;
+                                    let tabs_snapshot: Vec<(PathBuf, String)> = self
+                                        .open_tabs
+                                        .iter()
+                                        .map(|p| {
+                                            let name = p
+                                                .file_stem()
+                                                .unwrap_or_default()
+                                                .to_string_lossy()
+                                                .into_owned();
+                                            (p.clone(), name)
+                                        })
+                                        .collect();
+                                    for (i, (path, name)) in tabs_snapshot.iter().enumerate() {
+                                        let is_active = self.active_tab == Some(i);
+                                        let bg = if is_active {
+                                            ui.visuals().selection.bg_fill
+                                        } else {
+                                            egui::Color32::TRANSPARENT
+                                        };
+                                        let text_color = if is_active {
+                                            ui.visuals().strong_text_color()
+                                        } else {
+                                            ui.visuals().weak_text_color()
+                                        };
+                                        let tab_frame = egui::Frame::none()
+                                            .fill(bg)
+                                            .rounding(egui::Rounding {
+                                                nw: 4.0,
+                                                ne: 4.0,
+                                                sw: 0.0,
+                                                se: 0.0,
+                                            })
+                                            .inner_margin(egui::Margin::symmetric(8.0, 4.0));
+                                        let tab_response = ui
+                                            .allocate_ui_with_layout(
+                                                egui::vec2(0.0, tab_height),
+                                                egui::Layout::left_to_right(egui::Align::Center),
+                                                |ui| {
+                                                    tab_frame.show(ui, |ui| {
+                                                        let label = egui::RichText::new(name)
+                                                            .size(12.0)
+                                                            .color(text_color);
+                                                        let r = ui.label(label);
+                                                        // x button
+                                                        let x_color = ui
+                                                            .visuals()
+                                                            .widgets
+                                                            .inactive
+                                                            .fg_stroke
+                                                            .color;
+                                                        let x_btn = ui.add_sized(
+                                                            [16.0, 16.0],
+                                                            egui::Button::new(
+                                                                egui::RichText::new("×")
+                                                                    .size(12.0)
+                                                                    .color(x_color),
+                                                            )
+                                                            .frame(false),
+                                                        );
+                                                        if x_btn.clicked() {
+                                                            close_idx = Some(i);
+                                                        }
+                                                        r
+                                                    })
+                                                    .inner
+                                                },
+                                            )
+                                            .inner;
+                                        let tab_rect = tab_response.rect;
+                                        if tab_response
+                                            .interact(egui::Sense::click())
+                                            .clicked()
+                                        {
+                                            switch_idx = Some(i);
+                                        }
+                                        // Right-click context menu
+                                        tab_response.context_menu(|ui| {
+                                            if ui.button("Close").clicked() {
+                                                close_idx = Some(i);
+                                                ui.close_menu();
+                                            }
+                                            if ui.button("Close Others").clicked() {
+                                                // close all except i
+                                                let path = self.open_tabs[i].clone();
+                                                self.open_tabs.clear();
+                                                self.open_tabs.push(path);
+                                                self.active_tab = Some(0);
+                                                let p = self.open_tabs[0].clone();
+                                                self.open_file(&p);
+                                                ui.close_menu();
+                                            }
+                                            if ui.button("Close All").clicked() {
+                                                self.close_tab(i);
+                                                // close remaining
+                                                while !self.open_tabs.is_empty() {
+                                                    self.close_tab(0);
+                                                }
+                                                ui.close_menu();
+                                            }
+                                            if ui.button("Copy Path").clicked() {
+                                                ui.output_mut(|o| {
+                                                    o.copied_text =
+                                                        path.to_string_lossy().into_owned();
+                                                });
+                                                ui.close_menu();
+                                            }
+                                        });
+                                        // Active tab underline
+                                        if is_active {
+                                            let painter = ui.painter();
+                                            painter.line_segment(
+                                                [
+                                                    egui::pos2(tab_rect.left(), tab_rect.bottom()),
+                                                    egui::pos2(
+                                                        tab_rect.right(),
+                                                        tab_rect.bottom(),
+                                                    ),
+                                                ],
+                                                egui::Stroke::new(
+                                                    2.0_f32,
+                                                    ui.visuals().selection.stroke.color,
+                                                ),
+                                            );
+                                        }
+                                        ui.add_space(1.0);
+                                    }
+                                    if let Some(idx) = close_idx {
+                                        self.close_tab(idx);
+                                    }
+                                    if let Some(idx) = switch_idx {
+                                        self.switch_to_tab(idx);
+                                    }
+                                });
+                            });
+                    },
+                );
+                ui.separator();
+            }
             if let Some(path) = &self.current_file_path {
                 let name = path.file_name().unwrap_or_default().to_string_lossy();
 
-                ui.heading(name);
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(name.as_ref())
+                        .size(16.0)
+                        .strong(),
+                );
+                ui.add_space(2.0);
                 ui.separator();
+                ui.add_space(2.0);
 
                 if let Some((uri, bytes)) = &self.image_view {
                     egui::ScrollArea::both()
@@ -1454,6 +2450,27 @@ impl NotesApp {
                             text_editor(ui, &mut self.editor_text, path, !is_markdown)
                         })
                         .inner;
+
+                    // Editor context menu
+                    output.response.context_menu(|ui| {
+                        if ui.button("Insert code block").clicked() {
+                            let insert = "```\n\n```";
+                            self.insert_at_cursor(insert, &output);
+                            ui.close_menu();
+                        }
+                        if ui.button("Insert heading").clicked() {
+                            self.insert_at_cursor("# ", &output);
+                            ui.close_menu();
+                        }
+                        if ui.button("Insert bullet list").clicked() {
+                            self.insert_at_cursor("- ", &output);
+                            ui.close_menu();
+                        }
+                        if ui.button("Insert checkbox").clicked() {
+                            self.insert_at_cursor("- [ ] ", &output);
+                            ui.close_menu();
+                        }
+                    });
 
                     if self.focus_editor
                         && !self.is_creating_note
@@ -1525,13 +2542,27 @@ impl NotesApp {
                     }
                 }
             } else {
-                ui.add_space(70.0);
+                ui.add_space(100.0);
                 ui.vertical_centered(|ui| {
-                    ui.heading("Your notes, front and center.");
+                    ui.label(
+                        egui::RichText::new("✦")
+                            .size(36.0)
+                            .color(ui.visuals().widgets.noninteractive.fg_stroke.color),
+                    );
                     ui.add_space(12.0);
-                    ui.label("Open a note from the sidebar or start writing.");
-                    ui.add_space(20.0);
-                    if ui.button("+ Create a note").clicked() {
+                    ui.label(
+                        egui::RichText::new("Your notes, front and center.")
+                            .size(18.0)
+                            .strong(),
+                    );
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new("Open a note from the sidebar or start writing.")
+                            .size(13.0)
+                            .color(ui.visuals().widgets.noninteractive.fg_stroke.color),
+                    );
+                    ui.add_space(24.0);
+                    if ui.button("+  Create a note").clicked() {
                         self.is_creating_note = true;
                         self.new_note_name.clear();
                         self.create_note_target_dir = None;
@@ -1539,11 +2570,394 @@ impl NotesApp {
                     if ui.button("Open another vault").clicked() {
                         self.choose_vault();
                     }
-                    ui.add_space(20.0);
-                    ui.small("Ctrl+N  New note     Ctrl+K  Search     Ctrl+S  Save");
+                    ui.add_space(24.0);
+                    ui.label(
+                        egui::RichText::new("Ctrl+N  New note     Ctrl+K  Search     Ctrl+S  Save     Ctrl+P  Command     Ctrl+O  Open file")
+                            .size(11.5)
+                            .color(ui.visuals().widgets.noninteractive.fg_stroke.color),
+                    );
                 });
             }
-        });
+        }); // end CentralPanel
+
+        // Command Palette overlay (Ctrl+P)
+        if self.command_palette_open {
+            let query_lower = self.command_palette_query.to_lowercase();
+            let commands: Vec<(usize, &str, &str, &str)> = vec![
+                (0, "📝", "New Note", "Ctrl+N"),
+                (1, "💾", "Save", "Ctrl+S"),
+                (2, "🎨", "Toggle Theme", ""),
+                (3, "📂", "Open Vault", ""),
+                (4, "🔀", "Toggle Split View", ""),
+                (5, "📅", "Open Daily Note", ""),
+                (6, "🔗", "Toggle Connections", ""),
+                (7, "🔄", "Refresh", ""),
+                (8, "❌", "Close Tab", "Ctrl+W"),
+                (9, "➡️", "Next Tab", "Ctrl+Tab"),
+                (10, "⬅️", "Previous Tab", "Ctrl+Shift+Tab"),
+                (11, "⭐", "Star Note", "Ctrl+D"),
+            ];
+            // Add file entries starting at index 12
+            let file_entries: Vec<(PathBuf, String)> = self
+                .notes
+                .iter()
+                .filter(|(p, _)| {
+                    if query_lower.is_empty() {
+                        true
+                    } else {
+                        p.file_stem()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .to_lowercase()
+                            .contains(&query_lower)
+                    }
+                })
+                .take(20)
+                .map(|(p, _)| {
+                    let name = p
+                        .file_stem()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned();
+                    (p.clone(), name)
+                })
+                .collect();
+            let file_labels: Vec<(usize, String, String)> = file_entries
+                .iter()
+                .enumerate()
+                .map(|(i, (p, name))| {
+                    let rel = p
+                        .strip_prefix(&self.workspace_dir)
+                        .unwrap_or(p)
+                        .parent()
+                        .map(|d| d.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    (12 + i, name.clone(), rel)
+                })
+                .collect();
+            // Filter commands
+            let mut filtered: Vec<(usize, String, String, String)> = commands
+                .iter()
+                .filter(|(_, _, label, _)| {
+                    query_lower.is_empty() || label.to_lowercase().contains(&query_lower)
+                })
+                .map(|(i, icon, label, shortcut)| {
+                    (*i, icon.to_string(), label.to_string(), shortcut.to_string())
+                })
+                .collect();
+            // Filter files
+            let filtered_files: Vec<(usize, String, String, String)> = file_labels
+                .iter()
+                .filter(|(_, name, _)| {
+                    query_lower.is_empty() || name.to_lowercase().contains(&query_lower)
+                })
+                .map(|(i, name, rel)| (*i, "📄".into(), name.clone(), rel.clone()))
+                .collect();
+            filtered.extend(filtered_files);
+            if self.command_palette_selected >= filtered.len() {
+                self.command_palette_selected = filtered.len().saturating_sub(1);
+            }
+            let item_count = filtered.len();
+            egui::Area::new(egui::Id::new("command_palette_overlay"))
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, -60.0])
+                .order(egui::Order::Foreground)
+                .interactable(true)
+                .show(ctx, |ui| {
+                    egui::Frame::none()
+                        .fill(ui.visuals().extreme_bg_color)
+                        .rounding(10.0)
+                        .stroke(egui::Stroke::new(1.0_f32, ui.visuals().widgets.noninteractive.bg_stroke.color))
+                        .shadow(ui.visuals().popup_shadow)
+                        .inner_margin(8.0)
+                        .show(ui, |ui| {
+                            ui.set_min_width(420.0);
+                            ui.set_max_width(420.0);
+                            let response = ui.add(
+                                egui::TextEdit::singleline(&mut self.command_palette_query)
+                                    .hint_text("Type a command…")
+                                    .desired_width(400.0)
+                                    .frame(false),
+                            );
+                            if !response.has_focus() {
+                                response.request_focus();
+                            }
+                            ui.separator();
+                            egui::ScrollArea::vertical()
+                                .max_height(300.0)
+                                .show(ui, |ui| {
+                                    for (display_idx, item) in filtered.iter().enumerate() {
+                                        let (orig_idx, icon, label, shortcut) = item;
+                                        let selected = display_idx == self.command_palette_selected;
+                                        let bg = if selected {
+                                            ui.visuals().selection.bg_fill
+                                        } else {
+                                            egui::Color32::TRANSPARENT
+                                        };
+                                        let r = egui::Frame::none()
+                                            .fill(bg)
+                                            .rounding(4.0)
+                                            .inner_margin(egui::Margin::symmetric(6.0, 3.0))
+                                            .show(ui, |ui| {
+                                                ui.horizontal(|ui| {
+                                                    ui.label(egui::RichText::new(icon).size(13.0));
+                                                    ui.label(egui::RichText::new(label).size(13.0));
+                                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                        ui.label(
+                                                            egui::RichText::new(shortcut)
+                                                                .size(11.0)
+                                                                .color(ui.visuals().widgets.noninteractive.fg_stroke.color),
+                                                        );
+                                                    });
+                                                });
+                                            });
+                                        if r.response.interact(egui::Sense::click()).clicked() {
+                                            let cmd = *orig_idx;
+                                            self.command_palette_open = false;
+                                            self.execute_palette_command(cmd, ctx);
+                                        }
+                                    }
+                                });
+                            // Keyboard navigation
+                            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                                self.command_palette_open = false;
+                            }
+                            if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
+                                if self.command_palette_selected + 1 < item_count {
+                                    self.command_palette_selected += 1;
+                                }
+                            }
+                            if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
+                                if self.command_palette_selected > 0 {
+                                    self.command_palette_selected -= 1;
+                                }
+                            }
+                            if ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+                                let sel = self.command_palette_selected;
+                                if sel < filtered.len() {
+                                    let cmd = filtered[sel].0;
+                                    self.command_palette_open = false;
+                                    self.execute_palette_command(cmd, ctx);
+                                }
+                            }
+                        });
+                });
+        }
+
+        // Quick Switcher overlay (Ctrl+O)
+        if self.switcher_open {
+            let query_lower = self.switcher_query.to_lowercase();
+            let file_items: Vec<(PathBuf, String, String)> = self
+                .notes
+                .iter()
+                .filter(|(p, _)| {
+                    if query_lower.is_empty() {
+                        true
+                    } else {
+                        p.file_stem()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .to_lowercase()
+                            .contains(&query_lower)
+                    }
+                })
+                .take(30)
+                .map(|(p, _)| {
+                    let name = p
+                        .file_stem()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned();
+                    let rel = p
+                        .strip_prefix(&self.workspace_dir)
+                        .unwrap_or(p)
+                        .parent()
+                        .map(|d| d.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    (p.clone(), name, rel)
+                })
+                .collect();
+            if self.switcher_selected >= file_items.len() {
+                self.switcher_selected = file_items.len().saturating_sub(1);
+            }
+            let item_count = file_items.len();
+            egui::Area::new(egui::Id::new("quick_switcher_overlay"))
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, -60.0])
+                .order(egui::Order::Foreground)
+                .interactable(true)
+                .show(ctx, |ui| {
+                    egui::Frame::none()
+                        .fill(ui.visuals().extreme_bg_color)
+                        .rounding(10.0)
+                        .stroke(egui::Stroke::new(1.0_f32, ui.visuals().widgets.noninteractive.bg_stroke.color))
+                        .shadow(ui.visuals().popup_shadow)
+                        .inner_margin(8.0)
+                        .show(ui, |ui| {
+                            ui.set_min_width(420.0);
+                            ui.set_max_width(420.0);
+                            let response = ui.add(
+                                egui::TextEdit::singleline(&mut self.switcher_query)
+                                    .hint_text("Type to search files…")
+                                    .desired_width(400.0)
+                                    .frame(false),
+                            );
+                            if !response.has_focus() {
+                                response.request_focus();
+                            }
+                            ui.separator();
+                            egui::ScrollArea::vertical()
+                                .max_height(300.0)
+                                .show(ui, |ui| {
+                                    for (display_idx, (path, name, rel)) in file_items.iter().enumerate() {
+                                        let selected = display_idx == self.switcher_selected;
+                                        let bg = if selected {
+                                            ui.visuals().selection.bg_fill
+                                        } else {
+                                            egui::Color32::TRANSPARENT
+                                        };
+                                        let r = egui::Frame::none()
+                                            .fill(bg)
+                                            .rounding(4.0)
+                                            .inner_margin(egui::Margin::symmetric(6.0, 3.0))
+                                            .show(ui, |ui| {
+                                                ui.label(egui::RichText::new(name).size(13.0));
+                                                if !rel.is_empty() {
+                                                    ui.label(
+                                                        egui::RichText::new(rel)
+                                                            .size(11.0)
+                                                            .color(ui.visuals().widgets.noninteractive.fg_stroke.color),
+                                                    );
+                                                }
+                                            });
+                                        if r.response.interact(egui::Sense::click()).clicked() {
+                                            self.switcher_open = false;
+                                            self.open_file(path);
+                                        }
+                                    }
+                                });
+                            // Keyboard navigation
+                            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                                self.switcher_open = false;
+                            }
+                            if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
+                                if self.switcher_selected + 1 < item_count {
+                                    self.switcher_selected += 1;
+                                }
+                            }
+                            if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
+                                if self.switcher_selected > 0 {
+                                    self.switcher_selected -= 1;
+                                }
+                            }
+                            if ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+                                let sel = self.switcher_selected;
+                                if sel < file_items.len() {
+                                    let path = file_items[sel].0.clone();
+                                    self.switcher_open = false;
+                                    self.open_file(&path);
+                                }
+                            }
+                        });
+                });
+        }
+    }
+
+    fn execute_palette_command(&mut self, index: usize, ctx: &egui::Context) {
+        match index {
+            0 => {
+                // New Note
+                self.is_creating_note = true;
+                self.new_note_name.clear();
+                self.create_note_target_dir = None;
+            }
+            1 => {
+                // Save
+                self.save_current_file();
+            }
+            2 => {
+                // Toggle Theme
+                self.light_theme = !self.light_theme;
+                apply_theme(ctx, self.light_theme);
+            }
+            3 => {
+                // Open Vault
+                self.choose_vault();
+            }
+            4 => {
+                // Toggle Split View
+                self.display_mode = match self.display_mode {
+                    DisplayMode::EditOnly => DisplayMode::ViewOnly,
+                    DisplayMode::ViewOnly => DisplayMode::EditAndPreview,
+                    DisplayMode::EditAndPreview => DisplayMode::EditOnly,
+                };
+            }
+            5 => {
+                // Open Daily Note
+                let name = chrono::Local::now().format("%Y-%m-%d").to_string();
+                let path = self.workspace_dir.join(format!("{name}.md"));
+                if path.exists() {
+                    self.open_file(&path);
+                } else {
+                    self.new_note_name = name;
+                    self.create_note_target_dir = None;
+                    self.create_note();
+                }
+            }
+            6 => {
+                // Toggle Connections
+                self.show_connections = !self.show_connections;
+                if self.show_connections {
+                    self.content_requested = true;
+                }
+            }
+            7 => {
+                // Refresh
+                self.refresh();
+            }
+            8 => {
+                // Close Tab
+                if let Some(idx) = self.active_tab {
+                    self.close_tab(idx);
+                }
+            }
+            9 => {
+                // Next Tab
+                if let Some(active) = self.active_tab {
+                    if active + 1 < self.open_tabs.len() {
+                        self.switch_to_tab(active + 1);
+                    } else if !self.open_tabs.is_empty() {
+                        self.switch_to_tab(0);
+                    }
+                }
+            }
+            10 => {
+                // Previous Tab
+                if let Some(active) = self.active_tab {
+                    if active > 0 {
+                        self.switch_to_tab(active - 1);
+                    } else if !self.open_tabs.is_empty() {
+                        self.switch_to_tab(self.open_tabs.len() - 1);
+                    }
+                }
+            }
+            11 => {
+                // Star Note
+                if let Some(path) = &self.current_file_path.clone() {
+                    if self.starred.contains(path) {
+                        self.starred.remove(path);
+                    } else {
+                        self.starred.insert(path.clone());
+                    }
+                }
+            }
+            _ => {
+                // File item (index >= 12)
+                let file_idx = index - 12;
+                if file_idx < self.notes.len() {
+                    let path = self.notes[file_idx].0.clone();
+                    self.open_file(&path);
+                }
+            }
+        }
     }
 }
 
@@ -1625,6 +3039,22 @@ mod tests {
             create_folder_target: None,
             new_folder_name: String::new(),
             folder_error: String::new(),
+            open_tabs: Vec::new(),
+            active_tab: None,
+            command_palette_open: false,
+            command_palette_query: String::new(),
+            command_palette_selected: 0,
+            switcher_open: false,
+            switcher_query: String::new(),
+            switcher_selected: 0,
+            tags: Vec::new(),
+            active_tag: None,
+            show_tags: false,
+            show_outline: false,
+            starred: HashSet::new(),
+            is_renaming: false,
+            rename_target: None,
+            rename_name: String::new(),
         }
     }
 
@@ -1998,5 +3428,75 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn extracts_tags_from_note_content() {
+        let text = "This is a note with #rust and #programming tags.\nAlso #rust and #web-dev.";
+        let tags = extract_tags(text);
+        assert_eq!(tags, vec!["rust", "programming", "web-dev"]);
+    }
+
+    #[test]
+    fn ignores_tags_in_code_blocks() {
+        let text = "Some text #real\n```\n#not-a-tag\n```\nMore #valid";
+        let tags = extract_tags(text);
+        assert_eq!(tags, vec!["real", "valid"]);
+    }
+
+    #[test]
+    fn ignores_tags_in_inline_code() {
+        let text = "Use `#not-a-tag` but #real works";
+        let tags = extract_tags(text);
+        assert_eq!(tags, vec!["real"]);
+    }
+
+    #[test]
+    fn ignores_heading_hashes() {
+        let text = "# Heading\n## Sub heading\nSome #tag here";
+        let tags = extract_tags(text);
+        assert_eq!(tags, vec!["tag"]);
+    }
+
+    #[test]
+    fn extracts_headings_from_markdown() {
+        let text = "# Title\nSome text\n## Section\n### Sub\n```\n# Not a heading\n```";
+        let headings = extract_headings(text);
+        assert_eq!(
+            headings,
+            vec![
+                (1, "Title".to_string()),
+                (2, "Section".to_string()),
+                (3, "Sub".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn starred_toggle_and_persistence() {
+        let root = fixture();
+        let note = root.join("Star.md");
+        fs::write(&note, "content").unwrap();
+        let mut app = test_app(root);
+        app.open_file(&note);
+        assert!(app.starred.is_empty());
+        app.starred.insert(note.clone());
+        assert!(app.starred.contains(&note));
+        app.starred.remove(&note);
+        assert!(app.starred.is_empty());
+    }
+
+    #[test]
+    fn refresh_tags_collects_all_tags() {
+        let root = fixture();
+        let mut app = test_app(root.clone());
+        app.notes = vec![
+            (root.join("a.md"), "Hello #rust #code".into()),
+            (root.join("b.md"), "More #rust #web".into()),
+        ];
+        app.refresh_tags();
+        assert_eq!(app.tags.len(), 3); // code, rust, web (sorted)
+        let rust_entry = app.tags.iter().find(|(name, _)| name == "rust").unwrap();
+        assert_eq!(rust_entry.1.len(), 2); // appears in both notes
     }
 }
