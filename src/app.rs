@@ -1206,6 +1206,31 @@ impl NotesApp {
         }
     }
 
+    fn save_pasted_image(
+        &mut self,
+        img_data: arboard::ImageData,
+        filename: &str,
+        output: &egui::text_edit::TextEditOutput,
+    ) -> bool {
+        let target_dir = self.workspace_dir.join("_assets");
+        let _ = fs::create_dir_all(&target_dir);
+        let file_path = target_dir.join(filename);
+        let Some(img_buffer) = image::RgbaImage::from_raw(
+            img_data.width.try_into().unwrap(),
+            img_data.height.try_into().unwrap(),
+            img_data.bytes.into_owned(),
+        ) else {
+            return false;
+        };
+        if img_buffer.save(&file_path).is_err() {
+            return false;
+        }
+        let insert_text = format!("![[{}]]", filename);
+        self.insert_at_cursor(&insert_text, output);
+        self.image_cache.insert(filename.to_string(), file_path);
+        true
+    }
+
     fn choose_vault(&mut self) {
         if !self.save_current_file() {
             return;
@@ -2582,6 +2607,38 @@ impl NotesApp {
                 } else {
                     // Editor
 
+                    // Detect image paste before TextEdit processes Ctrl+V.
+                    // egui-winit converts Ctrl+V into Event::Paste(text) and
+                    // suppresses Event::Key for V. When the clipboard holds an
+                    // image (and optionally text), we intercept the Paste event,
+                    // check arboard for image data, and remove the event so
+                    // TextEdit doesn't also insert the text portion.
+                    let mut pending_image: Option<(arboard::ImageData, String)> = None;
+                    if is_markdown {
+                        let has_paste = ctx.input(|i| {
+                            i.events
+                                .iter()
+                                .any(|e| matches!(e, egui::Event::Paste(_)))
+                        });
+                        if has_paste {
+                            if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                                if let Ok(img_data) = clipboard.get_image() {
+                                    let filename = format!(
+                                        "Pasted image {}.png",
+                                        chrono::Local::now().format("%Y%m%d%H%M%S")
+                                    );
+                                    pending_image = Some((img_data, filename));
+                                    // Remove Paste event so TextEdit doesn't
+                                    // also insert the clipboard text.
+                                    ctx.input_mut(|i| {
+                                        i.events
+                                            .retain(|e| !matches!(e, egui::Event::Paste(_)));
+                                    });
+                                }
+                            }
+                        }
+                    }
+
                     let output = egui::ScrollArea::vertical()
                         .id_source(("editor_scroll", path))
                         .show(ui, |ui| {
@@ -2608,6 +2665,30 @@ impl NotesApp {
                             self.insert_at_cursor("- [ ] ", &output);
                             ui.close_menu();
                         }
+                        if is_markdown {
+                            ui.separator();
+                            if ui.button("📋 Paste Image").clicked() {
+                                if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                                    if let Ok(img_data) = clipboard.get_image() {
+                                        let filename = format!(
+                                            "Pasted image {}.png",
+                                            chrono::Local::now().format("%Y%m%d%H%M%S")
+                                        );
+                                        if self.save_pasted_image(
+                                            img_data,
+                                            &filename,
+                                            &output,
+                                        ) {
+                                            self.last_edit = Some(Instant::now());
+                                            ctx.request_repaint_after(
+                                                Duration::from_millis(700),
+                                            );
+                                        }
+                                    }
+                                }
+                                ui.close_menu();
+                            }
+                        }
                     });
 
                     if self.focus_editor
@@ -2618,60 +2699,8 @@ impl NotesApp {
                         self.focus_editor = false;
                     }
                     let mut pasted_image = false;
-                    let is_ctrl_v =
-                        ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::V));
-                    if is_markdown && output.response.has_focus() && is_ctrl_v {
-                        if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                            if let Ok(img_data) = clipboard.get_image() {
-                                let target_dir = self.workspace_dir.join("_assets");
-                                let _ = fs::create_dir_all(&target_dir);
-                                let filename = format!(
-                                    "Pasted image {}.png",
-                                    chrono::Local::now().format("%Y%m%d%H%M%S")
-                                );
-                                let file_path = target_dir.join(&filename);
-                                if let Some(img_buffer) = image::RgbaImage::from_raw(
-                                    img_data.width.try_into().unwrap(),
-                                    img_data.height.try_into().unwrap(),
-                                    img_data.bytes.into_owned(),
-                                ) {
-                                    if img_buffer.save(&file_path).is_ok() {
-                                        let insert_text = format!("![[{}]]", filename);
-                                        if let Some(cursor_range) = output.cursor_range {
-                                            let min = cursor_range
-                                                .primary
-                                                .ccursor
-                                                .index
-                                                .min(cursor_range.secondary.ccursor.index);
-                                            let max = cursor_range
-                                                .primary
-                                                .ccursor
-                                                .index
-                                                .max(cursor_range.secondary.ccursor.index);
-                                            let byte_min = self
-                                                .editor_text
-                                                .char_indices()
-                                                .nth(min)
-                                                .map(|(i, _)| i)
-                                                .unwrap_or(self.editor_text.len());
-                                            let byte_max = self
-                                                .editor_text
-                                                .char_indices()
-                                                .nth(max)
-                                                .map(|(i, _)| i)
-                                                .unwrap_or(self.editor_text.len());
-                                            self.editor_text
-                                                .replace_range(byte_min..byte_max, &insert_text);
-                                        } else {
-                                            self.editor_text
-                                                .push_str(&format!("\n{}\n", insert_text));
-                                        }
-                                        self.image_cache.insert(filename, file_path);
-                                        pasted_image = true;
-                                    }
-                                }
-                            }
-                        }
+                    if let Some((img_data, filename)) = pending_image {
+                        pasted_image = self.save_pasted_image(img_data, &filename, &output);
                     }
 
                     if output.response.changed() || pasted_image {
