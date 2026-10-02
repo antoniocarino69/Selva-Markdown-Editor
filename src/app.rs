@@ -233,10 +233,13 @@ fn file_manager_command(path: &Path) -> std::io::Result<std::process::Command> {
     #[cfg(target_os = "windows")]
     {
         let mut command = std::process::Command::new("explorer.exe");
-        if !is_dir {
-            command.arg("/select,");
+        if is_dir {
+            command.arg(path);
+        } else {
+            // Explorer only selects the file when '/select,<path>' is passed
+            // as ONE argument.
+            command.arg(format!("/select,{}", path.display()));
         }
-        command.arg(path);
         Ok(command)
     }
     #[cfg(target_os = "macos")]
@@ -315,6 +318,11 @@ pub struct NotesApp {
     /// Inner edges of the visible panels, measured each frame; the resize
     /// grips sit on these (the egui frame margins make nominal widths drift).
     panel_edges: Vec<(&'static str, f32)>,
+    /// Files listed in the command palette, in display order; palette entries
+    /// carry their index into this list (not into the full notes vector).
+    palette_files: Vec<PathBuf>,
+    /// External file awaiting user confirmation before launching it.
+    pending_external: Option<PathBuf>,
 }
 
 struct FileNode {
@@ -645,9 +653,11 @@ fn extract_tags(text: &str) -> Vec<String> {
         let mut chars = trimmed.char_indices().peekable();
         while let Some((i, ch)) = chars.next() {
             if ch == '`' {
-                // Skip inline code
+                // Skip inline code (`end` is a byte offset, the iterator
+                // yields characters: convert before consuming).
                 if let Some(end) = trimmed[i + 1..].find('`') {
-                    for _ in 0..=end {
+                    let skip = trimmed[i + 1..=i + 1 + end].chars().count();
+                    for _ in 0..skip {
                         chars.next();
                     }
                     continue;
@@ -895,6 +905,8 @@ impl NotesApp {
             rename_target: None,
             rename_name: String::new(),
             panel_edges: Vec::new(),
+            palette_files: Vec::new(),
+            pending_external: None,
         };
         if let Some(storage) = cc.storage {
             if let Some(saved) = eframe::get_value::<HashSet<PathBuf>>(storage, "starred") {
@@ -936,9 +948,9 @@ impl NotesApp {
         }
         match open_kind(path) {
             OpenKind::External => {
-                if let Err(e) = open::that(path) {
-                    self.status = format!("Could not open with the default app: {e}");
-                }
+                // Never launch a vault file silently: a synced vault could
+                // contain an executable. Ask first.
+                self.pending_external = Some(path.to_path_buf());
                 return;
             }
             OpenKind::Image => {
@@ -990,16 +1002,16 @@ impl NotesApp {
                 self.last_edit = None;
                 self.refresh_backlinks();
                 self.status = "Saved".into();
+                // Manage tabs only for files that actually opened.
+                let path_buf = path.to_path_buf();
+                if let Some(idx) = self.open_tabs.iter().position(|p| p == &path_buf) {
+                    self.active_tab = Some(idx);
+                } else {
+                    self.open_tabs.push(path_buf);
+                    self.active_tab = Some(self.open_tabs.len() - 1);
+                }
             }
             Err(e) => self.status = format!("Could not read file: {e}"),
-        }
-        // Manage tabs
-        let path_buf = path.to_path_buf();
-        if let Some(idx) = self.open_tabs.iter().position(|p| p == &path_buf) {
-            self.active_tab = Some(idx);
-        } else {
-            self.open_tabs.push(path_buf);
-            self.active_tab = Some(self.open_tabs.len() - 1);
         }
     }
 
@@ -1230,15 +1242,21 @@ impl NotesApp {
     fn update_wiki_links(&mut self, old_name: &str, new_name: &str) {
         // Update wiki-links in all notes that reference the old name
         for (path, text) in &mut self.notes {
-            if !text.contains(old_name) {
+            let is_current = self.current_file_path.as_deref() == Some(path.as_path());
+            // Rewrite from the live buffer for the open note so unsaved edits
+            // are preserved (and saved_text stays in sync for autosave).
+            let updated = if is_current {
+                self.editor_text.clone()
+            } else {
+                text.clone()
+            };
+            if !updated.contains(old_name) {
                 continue;
             }
-            let links = wiki_links(text);
+            let links = wiki_links(&updated);
             if !links.iter().any(|link| link.eq_ignore_ascii_case(old_name)) {
                 continue;
             }
-            // Replace [[old_name]] with [[new_name]] (preserving case patterns)
-            let updated = text.clone();
             // Find and replace wiki-link references
             let mut result = String::new();
             let mut remaining = updated.as_str();
@@ -1252,8 +1270,11 @@ impl NotesApp {
                         .split('#').next().unwrap_or("")
                         .trim();
                     if target.eq_ignore_ascii_case(old_name) {
-                        // Replace the target part while preserving alias/heading
-                        let rest = &link_content[target.len()..];
+                        // Replace the target while preserving alias/heading.
+                        // Locate the target inside the raw link content: its
+                        // trimmed form may be offset by leading whitespace.
+                        let offset = link_content.find(target).unwrap_or(0);
+                        let rest = &link_content[offset + target.len()..];
                         result.push_str(&format!("[[{}{}]]", new_name, rest));
                     } else {
                         result.push_str(&remaining[start..start + end + 2]);
@@ -1265,11 +1286,15 @@ impl NotesApp {
                 }
             }
             result.push_str(remaining);
-            if result != *text {
+            if result != updated {
                 if let Err(e) = fs::write(path.as_path(), &result) {
                     self.status = format!("Could not update links in {}: {e}", path.display());
                 } else {
-                    *text = result;
+                    *text = result.clone();
+                    if is_current {
+                        self.editor_text = result;
+                        self.saved_text = self.editor_text.clone();
+                    }
                 }
             }
         }
@@ -1312,21 +1337,38 @@ impl NotesApp {
         output: &egui::text_edit::TextEditOutput,
     ) -> bool {
         let target_dir = self.workspace_dir.join("_assets");
-        let _ = fs::create_dir_all(&target_dir);
-        let file_path = target_dir.join(filename);
+        if let Err(e) = fs::create_dir_all(&target_dir) {
+            self.status = format!("Could not save pasted image: {e}");
+            return false;
+        }
+        // Timestamps have one-second granularity: never overwrite an earlier
+        // paste, and insert a link to the name actually used on disk.
+        let mut file_path = target_dir.join(filename);
+        if file_path.exists() {
+            let stem = file_path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+            for n in 2..10_000 {
+                file_path = target_dir.join(format!("{stem} {n}.png"));
+                if !file_path.exists() {
+                    break;
+                }
+            }
+        }
         let Some(img_buffer) = image::RgbaImage::from_raw(
             img_data.width.try_into().unwrap(),
             img_data.height.try_into().unwrap(),
             img_data.bytes.into_owned(),
         ) else {
+            self.status = "Could not decode pasted image.".into();
             return false;
         };
         if img_buffer.save(&file_path).is_err() {
+            self.status = "Could not save pasted image.".into();
             return false;
         }
-        let insert_text = format!("![[{}]]", filename);
+        let saved_name = file_path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        let insert_text = format!("![[{saved_name}]]");
         self.insert_at_cursor(&insert_text, output);
-        self.image_cache.insert(filename.to_string(), file_path);
+        self.image_cache.insert(saved_name, file_path);
         true
     }
 
@@ -1359,6 +1401,11 @@ impl NotesApp {
             self.tags.clear();
             self.active_tag = None;
             self.show_outline = false;
+            // Tabs and stars belong to the previous vault: drop them so no
+            // entry can open a file outside the newly chosen vault.
+            self.open_tabs.clear();
+            self.active_tab = None;
+            self.starred.retain(|p| p.starts_with(&self.workspace_dir));
             self.file_tree = empty_tree(self.workspace_dir.clone());
             self.refresh();
         }
@@ -1430,9 +1477,14 @@ impl NotesApp {
         }
     }
 
-    fn close_tab(&mut self, index: usize) {
+    /// Returns true when the tab was actually closed. A pending save that
+    /// fails (external edits) keeps the tab open so no draft is lost.
+    fn close_tab(&mut self, index: usize) -> bool {
         if index >= self.open_tabs.len() {
-            return;
+            return false;
+        }
+        if !self.save_current_file() {
+            return false;
         }
         self.open_tabs.remove(index);
         if self.open_tabs.is_empty() {
@@ -1460,6 +1512,7 @@ impl NotesApp {
                 self.open_file(&path);
             }
         }
+        true
     }
 
     fn switch_to_tab(&mut self, index: usize) {
@@ -2322,6 +2375,9 @@ impl NotesApp {
                                                     *tab = new_path.clone();
                                                 }
                                             }
+                                            if self.starred.remove(&target) {
+                                                self.starred.insert(new_path.clone());
+                                            }
                                             self.is_renaming = false;
                                             self.rename_target = None;
                                             self.refresh();
@@ -2344,6 +2400,40 @@ impl NotesApp {
             } else {
                 self.is_renaming = false;
             }
+        }
+        if let Some(path) = self.pending_external.clone() {
+            egui::Window::new("Open external file")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .title_bar(false)
+                .show(ctx, |ui| {
+                    ui.label(
+                        egui::RichText::new("Open with the default app?")
+                            .size(15.0)
+                            .strong(),
+                    );
+                    ui.add_space(2.0);
+                    ui.label(
+                        egui::RichText::new(path.display().to_string())
+                            .size(12.0)
+                            .color(ui.visuals().widgets.noninteractive.fg_stroke.color),
+                    );
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Open").clicked() {
+                            if let Err(e) = open::that(&path) {
+                                self.status = format!("Could not open with the default app: {e}");
+                            }
+                            self.pending_external = None;
+                        }
+                        if ui.button("Cancel").clicked()
+                            || ui.input(|i| i.key_pressed(egui::Key::Escape))
+                        {
+                            self.pending_external = None;
+                        }
+                    });
+                });
         }
 
         match action {
@@ -2370,11 +2460,29 @@ impl NotesApp {
                 match fs::create_dir_all(&trash).and_then(|_| fs::rename(&path, destination)) {
                     Ok(()) => {
                         self.status = "Note moved to .selva-trash (recoverable).".into();
-                        if self.current_file_path.as_ref() == Some(&path) {
+                        let was_current = self.current_file_path.as_ref() == Some(&path);
+                        self.starred.remove(&path);
+                        if let Some(idx) = self.open_tabs.iter().position(|t| *t == path) {
+                            self.open_tabs.remove(idx);
+                            if self.open_tabs.is_empty() {
+                                self.active_tab = None;
+                            } else if let Some(active) = self.active_tab {
+                                self.active_tab = Some(
+                                    if active > idx { active - 1 } else { active }
+                                        .min(self.open_tabs.len() - 1),
+                                );
+                            }
+                        }
+                        if was_current {
                             self.current_file_path = None;
                             self.image_view = None;
                             self.editor_text.clear();
                             self.saved_text.clear();
+                            self.last_edit = None;
+                            if let Some(active) = self.active_tab {
+                                let next = self.open_tabs[active].clone();
+                                self.open_file(&next);
+                            }
                         }
                         self.refresh();
                     }
@@ -2715,11 +2823,10 @@ impl NotesApp {
                                                 ui.close_menu();
                                             }
                                             if ui.button("Close All").clicked() {
-                                                self.close_tab(i);
-                                                // close remaining
-                                                while !self.open_tabs.is_empty() {
-                                                    self.close_tab(0);
-                                                }
+                                                // close remaining (close_tab
+                                                // refuses when a save fails)
+                                                while !self.open_tabs.is_empty() && self.close_tab(0)
+                                                {}
                                                 ui.close_menu();
                                             }
                                             if ui.button("Copy Path").clicked() {
@@ -2978,6 +3085,7 @@ impl NotesApp {
                     (p.clone(), name)
                 })
                 .collect();
+            self.palette_files = file_entries.iter().map(|(p, _)| p.clone()).collect();
             let file_labels: Vec<(usize, String, String)> = file_entries
                 .iter()
                 .enumerate()
@@ -3360,10 +3468,13 @@ impl NotesApp {
                 }
             }
             _ => {
-                // File item (index >= 12)
-                let file_idx = index - 12;
-                if file_idx < self.notes.len() {
-                    let path = self.notes[file_idx].0.clone();
+                // File item (index >= 12): position in the palette's own
+                // filtered list, not in the full notes vector.
+                let path = index
+                    .checked_sub(12)
+                    .and_then(|i| self.palette_files.get(i))
+                    .cloned();
+                if let Some(path) = path {
                     self.open_file(&path);
                 }
             }
@@ -3470,6 +3581,8 @@ mod tests {
             rename_target: None,
             rename_name: String::new(),
             panel_edges: Vec::new(),
+            palette_files: Vec::new(),
+            pending_external: None,
         }
     }
 
@@ -3488,9 +3601,10 @@ mod tests {
             vec![folder.as_os_str()]
         );
         let command = file_manager_command(&note).unwrap();
+        let expected = format!("/select,{}", note.display());
         assert_eq!(
             command.get_args().collect::<Vec<_>>(),
-            vec![std::ffi::OsStr::new("/select,"), note.as_os_str()]
+            vec![std::ffi::OsStr::new(expected.as_str())]
         );
         assert!(file_manager_command(&root.join("Missing.md")).is_err());
     }
@@ -4387,6 +4501,85 @@ mod tests {
         assert!(app.expanded.contains(&folder));
         assert!(app.starred.contains(&folder));
         assert!(app.search.is_empty());
+    }
+
+    #[test]
+    fn closing_the_last_tab_preserves_unsaved_edits() {
+        let root = fixture();
+        let note = root.join("Draft.md");
+        fs::write(&note, "originale").unwrap();
+        let mut app = test_app(root);
+        app.open_file(&note);
+        app.editor_text = "bozza non salvata".into();
+        assert!(app.close_tab(0));
+        assert!(app.open_tabs.is_empty());
+        assert_eq!(fs::read_to_string(&note).unwrap(), "bozza non salvata");
+    }
+
+    #[test]
+    fn closing_a_tab_keeps_it_open_when_the_save_is_blocked() {
+        let root = fixture();
+        let note = root.join("Busy.md");
+        fs::write(&note, "originale").unwrap();
+        let mut app = test_app(root);
+        app.open_file(&note);
+        app.editor_text = "bozza".into();
+        fs::write(&note, "cambiamento esterno").unwrap();
+        assert!(!app.close_tab(0));
+        assert_eq!(app.open_tabs, vec![note.clone()]);
+        assert_eq!(app.editor_text, "bozza");
+    }
+
+    #[test]
+    fn palette_opens_the_highlighted_file_even_when_filtered() {
+        let root = fixture();
+        let a = root.join("Alfa.md");
+        let b = root.join("Beta.md");
+        let c = root.join("Gamma uno.md");
+        for p in [&a, &b, &c] {
+            fs::write(p, "# t").unwrap();
+        }
+        let mut app = test_app(root.clone());
+        app.notes = vec![
+            (a, "# t".into()),
+            (b, "# t".into()),
+            (c.clone(), "# t".into()),
+        ];
+        app.command_palette_open = true;
+        app.command_palette_query = "gamma".into();
+        let ctx = egui::Context::default();
+        pointer_frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.palette_files, vec![c.clone()]);
+        app.execute_palette_command(12, &ctx);
+        assert_eq!(app.current_file_path.as_ref(), Some(&c));
+    }
+
+    #[test]
+    fn wiki_link_rewrite_preserves_aliases_and_unsaved_buffers() {
+        let root = fixture();
+        let first = root.join("Link.md");
+        let second = root.join("Altro.md");
+        let target = root.join("Idea.md");
+        fs::write(&first, "testo").unwrap();
+        fs::write(&second, "vedi [[Idea#parte]]").unwrap();
+        fs::write(&target, "# Idea").unwrap();
+        let mut app = test_app(root.clone());
+        app.notes.push((first.clone(), "testo".into()));
+        app.notes.push((second.clone(), "vedi [[Idea#parte]]".into()));
+        app.notes.push((target, "# Idea".into()));
+        app.open_file(&first);
+        // Unsaved edit in the open note, with whitespace inside the brackets.
+        app.editor_text = "bozza vedi [[ Idea|alias]]".into();
+        app.update_wiki_links("Idea", "Nuova");
+        assert_eq!(app.editor_text, "bozza vedi [[Nuova|alias]]");
+        assert_eq!(app.saved_text, app.editor_text);
+        assert_eq!(fs::read_to_string(&first).unwrap(), app.editor_text);
+        assert_eq!(fs::read_to_string(&second).unwrap(), "vedi [[Nuova#parte]]");
+    }
+
+    #[test]
+    fn tags_after_multibyte_inline_code_are_not_dropped() {
+        assert_eq!(extract_tags("x `à`#real"), vec!["real"]);
     }
 
     #[test]
