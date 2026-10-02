@@ -24,6 +24,102 @@ enum FileAction {
     CreateFolder(PathBuf),
     ShowInFileManager(PathBuf),
     Rename(PathBuf),
+    MoveNote { source: PathBuf, folder: PathBuf },
+}
+
+struct DraggedNote {
+    path: PathBuf,
+    vault: PathBuf,
+}
+
+fn note_drag_source(response: egui::Response, path: &Path, vault: &Path) -> egui::Response {
+    if !matches!(open_kind(path), OpenKind::Markdown | OpenKind::Text) {
+        return response;
+    }
+    // Extend the row's own sense instead of overlaying a second widget on the
+    // same rect: an overlay would win the click hit-test and `clicked()` on the
+    // row would never fire, making notes unselectable.
+    let response = response.interact(egui::Sense::click_and_drag());
+    if response.drag_started_by(egui::PointerButton::Primary) {
+        egui::DragAndDrop::set_payload(
+            &response.ctx,
+            DraggedNote {
+                path: path.to_path_buf(),
+                vault: vault.to_path_buf(),
+            },
+        );
+    }
+    response
+}
+
+/// Drop target for notes: highlights while a note hovers, and returns true once
+/// the pointer has hovered long enough that the caller should expand a closed
+/// folder so its subfolders become valid drop targets too.
+fn note_drop_target(
+    ui: &egui::Ui,
+    response: &egui::Response,
+    folder: &Path,
+    vault: &Path,
+    action: &mut FileAction,
+) -> bool {
+    let timer_id = response.id.with("drop_hover");
+    let hovering = response
+        .dnd_hover_payload::<DraggedNote>()
+        .filter(|note| note.vault == *vault);
+    if hovering.is_none() {
+        let _ = ui.ctx().data_mut(|data| data.remove::<f64>(timer_id));
+        return false;
+    }
+    let now = ui.input(|input| input.time);
+    let since = ui
+        .ctx()
+        .data_mut(|data| *data.get_temp_mut_or_insert_with(timer_id, || now));
+    ui.painter().rect_stroke(
+        response.rect,
+        3.0,
+        egui::Stroke::new(2.0_f32, ui.visuals().selection.stroke.color),
+    );
+    if let Some(note) = response.dnd_release_payload::<DraggedNote>() {
+        *action = FileAction::MoveNote {
+            source: note.path.clone(),
+            folder: folder.to_path_buf(),
+        };
+    }
+    ui.ctx().request_repaint_after(Duration::from_millis(100));
+    now - since >= 0.6
+}
+
+// MoveFileW refuses an existing destination, including a file created after
+// validation: the check-then-move race can never overwrite a file.
+#[cfg(target_os = "windows")]
+fn move_without_overwrite(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn MoveFileW(source: *const u16, destination: *const u16) -> i32;
+    }
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    // Both arguments are live, NUL-terminated UTF-16 buffers.
+    if unsafe { MoveFileW(source.as_ptr(), destination.as_ptr()) } == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn move_without_overwrite(source: &Path, destination: &Path) -> std::io::Result<()> {
+    fs::hard_link(source, destination)?;
+    if let Err(error) = fs::remove_file(source) {
+        let _ = fs::remove_file(destination);
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn file_context_menu(ui: &mut egui::Ui, path: &Path, is_dir: bool, action: &mut FileAction) {
@@ -207,6 +303,7 @@ struct VaultIndex {
 }
 
 enum ScanMessage {
+    Preview(FileNode),
     Tree(FileNode),
     Ready(VaultIndex),
     Error(String),
@@ -239,7 +336,7 @@ fn scan_vault(
         }
     }
     sort_nodes(shallow.children.as_mut().unwrap());
-    if tx.send(ScanMessage::Tree(shallow)).is_err() {
+    if tx.send(ScanMessage::Preview(shallow)).is_err() {
         return;
     }
     let mut children: std::collections::HashMap<PathBuf, Vec<FileNode>> =
@@ -837,6 +934,82 @@ impl NotesApp {
         }
         true
     }
+    fn move_note(&mut self, source: &Path, folder: &Path) {
+        let result = (|| -> Result<Option<PathBuf>, String> {
+            let root = self
+                .workspace_dir
+                .canonicalize()
+                .map_err(|e| e.to_string())?;
+            let actual_source = source.canonicalize().map_err(|e| e.to_string())?;
+            let actual_folder = folder.canonicalize().map_err(|e| e.to_string())?;
+            if !actual_source.starts_with(&root)
+                || !actual_folder.starts_with(&root)
+                || !fs::symlink_metadata(source)
+                    .map_err(|e| e.to_string())?
+                    .is_file()
+                || !actual_folder.is_dir()
+                || !matches!(open_kind(source), OpenKind::Markdown | OpenKind::Text)
+            {
+                return Err("Choose a note and a folder inside this vault.".into());
+            }
+            if actual_source.parent() == Some(actual_folder.as_path()) {
+                return Ok(None);
+            }
+            let destination = folder.join(source.file_name().ok_or("Invalid note name")?);
+            if destination.try_exists().map_err(|e| e.to_string())? {
+                return Err(
+                    "A file with this name already exists in the destination folder.".into(),
+                );
+            }
+            Ok(Some(destination))
+        })();
+        let destination = match result {
+            Ok(Some(path)) => path,
+            Ok(None) => {
+                self.status = "The note is already in this folder.".into();
+                return;
+            }
+            Err(error) => {
+                self.status = format!("Could not move note: {error}");
+                return;
+            }
+        };
+        let is_open = self.current_file_path.as_deref() == Some(source);
+        if is_open && !self.save_current_file() {
+            return;
+        }
+        if let Err(error) = move_without_overwrite(source, &destination) {
+            self.status = format!("Could not move note: {error}");
+            return;
+        }
+        if is_open {
+            self.current_file_path = Some(destination.clone());
+            self.last_edit = None;
+        }
+        for (path, _) in &mut self.notes {
+            if path == source {
+                *path = destination.clone();
+            }
+        }
+        for tab in &mut self.open_tabs {
+            if tab == source {
+                *tab = destination.clone();
+            }
+        }
+        if self.starred.remove(source) {
+            self.starred.insert(destination.clone());
+        }
+        for ancestor in folder.ancestors() {
+            if ancestor.starts_with(&self.workspace_dir) {
+                self.expanded.insert(ancestor.to_path_buf());
+            }
+        }
+        self.indexed_query = None;
+        self.refresh_backlinks();
+        self.refresh();
+        self.status = "Note moved.".into();
+    }
+
     fn refresh(&mut self) {
         self.scan_cancel.store(true, Ordering::Relaxed);
         self.scan_cancel = Arc::new(AtomicBool::new(false));
@@ -856,8 +1029,24 @@ impl NotesApp {
     }
 
     fn poll_scan(&mut self, ctx: &egui::Context) {
+        // Keep drop targets under the pointer stable until the drag has finished.
+        if egui::DragAndDrop::has_payload_of_type::<DraggedNote>(ctx) {
+            return;
+        }
         if let Some(rx) = &self.scan {
             match rx.try_recv() {
+                Ok(ScanMessage::Preview(tree)) => {
+                    // A shallow startup preview must not collapse a populated tree.
+                    if self
+                        .file_tree
+                        .children
+                        .as_ref()
+                        .map_or(true, |children| children.is_empty())
+                    {
+                        self.file_tree = tree;
+                    }
+                    ctx.request_repaint();
+                }
                 Ok(ScanMessage::Tree(tree)) => {
                     self.file_tree = tree;
                     ctx.request_repaint();
@@ -1182,6 +1371,14 @@ impl eframe::App for NotesApp {
 
 impl NotesApp {
     fn ui(&mut self, ctx: &egui::Context) {
+        if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+            egui::DragAndDrop::clear_payload(ctx);
+        }
+        if let Some(note) = egui::DragAndDrop::payload::<DraggedNote>(ctx) {
+            if note.vault != self.workspace_dir {
+                egui::DragAndDrop::clear_payload(ctx);
+            }
+        }
         self.poll_scan(ctx);
         if self
             .last_edit
@@ -1515,6 +1712,8 @@ impl NotesApp {
                                 current.as_ref() == Some(path),
                                 egui::RichText::new(label_text).size(13.0),
                             ));
+                            let response =
+                                note_drag_source(response, path, &self.workspace_dir);
                             if response.clicked() {
                                 action = FileAction::Open(path.clone());
                             }
@@ -1526,8 +1725,25 @@ impl NotesApp {
                     ui.add_space(2.0);
                     ui.separator();
                 }
-                if self.search.trim().is_empty() {
-                    // If a tag is active, show filtered list instead of full tree
+                // While a note is dragged the folder tree must stay visible as the
+                // set of drop targets, even when searching or filtering by tag.
+                let show_tree = (self.search.trim().is_empty() && self.active_tag.is_none())
+                    || egui::DragAndDrop::has_payload_of_type::<DraggedNote>(ui.ctx());
+                let root_response = ui
+                    .add_sized(
+                        [ui.available_width(), 22.0],
+                        egui::SelectableLabel::new(false, "Vault root"),
+                    )
+                    .on_hover_text("Drop a note here to move it to the vault root");
+                note_drop_target(
+                    ui,
+                    &root_response,
+                    &self.workspace_dir,
+                    &self.workspace_dir,
+                    &mut action,
+                );
+                if !show_tree && self.search.trim().is_empty() {
+                    // If a tag is active, show its filtered list instead of the full tree
                     if let Some(active) = &self.active_tag {
                         let tag_paths: Vec<PathBuf> = self.tags.iter()
                             .find(|(name, _)| name == active)
@@ -1548,6 +1764,8 @@ impl NotesApp {
                                         current.as_ref() == Some(path),
                                         name,
                                     ));
+                                    let response =
+                                        note_drag_source(response, path, &self.workspace_dir);
                                     if response.clicked() {
                                         action = FileAction::Open(path.clone());
                                     }
@@ -1556,10 +1774,10 @@ impl NotesApp {
                                     });
                                 }
                             });
-                    } else {
+                    }
+                } else if show_tree {
                     let mut rows = Vec::new();
                     tree_rows(&self.file_tree, &self.expanded, &mut rows);
-                    let mut needs_refresh = false;
                     egui::ScrollArea::vertical()
                         .id_source("vault_files")
                         .auto_shrink([false, false])
@@ -1616,96 +1834,23 @@ impl NotesApp {
                                             label_text,
                                         ))
                                         .on_hover_text(node.path.display().to_string());
-                                    // Drag & drop: files are draggable, folders are drop targets.
-                                    // Extend the row's own sense via `Response::interact` instead of
-                                    // overlaying `ui.interact` on the same rect: a second widget would
-                                    // win the click hit-test and `response.clicked()` would never fire,
-                                    // making notes unselectable.
-                                    if !node.is_dir {
-                                        let drag_response =
-                                            response.interact(egui::Sense::click_and_drag());
-                                        if drag_response.drag_started() {
-                                            ui.ctx().memory_mut(|mem| {
-                                                mem.data.insert_temp(
-                                                    egui::Id::new("dnd_source"),
-                                                    node.path.clone(),
-                                                )
-                                            });
-                                        }
-                                    }
-                                    // Drop target for folders
-                                    if node.is_dir {
-                                        let has_drag = ui.ctx().memory(|mem| {
-                                            mem.data
-                                                .get_temp::<PathBuf>(egui::Id::new("dnd_source"))
-                                                .is_some()
-                                        });
-                                        // `Response::hovered()` is suppressed while dragging (only the
-                                        // dragged widget counts as hovered), so test the pointer
-                                        // position against the row rect instead: this keeps the drop
-                                        // target highlighted for the whole drag.
-                                        let pointer_over = ui.ctx().input(|i| {
-                                            i.pointer
-                                                .interact_pos()
-                                                .map_or(false, |pos| response.rect.contains(pos))
-                                        });
-                                        if has_drag && pointer_over {
-                                            // Highlight drop target
-                                            let rect = response.rect;
-                                            ui.painter().rect_filled(
-                                                rect,
-                                                egui::Rounding::same(4.0),
-                                                ui.visuals().selection.bg_fill,
-                                            );
-                                            ui.painter().rect_stroke(
-                                                rect,
-                                                egui::Rounding::same(4.0),
-                                                egui::Stroke::new(
-                                                    2.0_f32,
-                                                    ui.visuals().selection.stroke.color,
-                                                ),
-                                            );
-                                            // Perform drop if pointer released
-                                            if ui.ctx().input(|i| i.pointer.any_released()) {
-                                                if let Some(src_path) = ui
-                                                    .ctx()
-                                                    .memory(|mem| {
-                                                        mem.data.get_temp::<PathBuf>(egui::Id::new(
-                                                            "dnd_source",
-                                                        ))
-                                                    })
-                                                {
-                                                    let file_name = src_path
-                                                        .file_name()
-                                                        .unwrap_or_default();
-                                                    let dest = node.path.join(file_name);
-                                                    if !dest.exists() {
-                                                        if let Err(e) = fs::rename(&src_path, &dest)
-                                                        {
-                                                            self.status = format!(
-                                                                "Could not move: {e}"
-                                                            );
-                                                        } else {
-                                                            if self.current_file_path.as_ref()
-                                                                == Some(&src_path)
-                                                            {
-                                                                self.current_file_path =
-                                                                    Some(dest);
-                                                            }
-                                                            needs_refresh = true;
-                                                            self.status =
-                                                                "File moved.".into();
-                                                        }
-                                                    }
-                                                    ui.ctx().memory_mut(|mem| {
-                                                        mem.data
-                                                            .remove::<PathBuf>(egui::Id::new(
-                                                                "dnd_source",
-                                                            ))
-                                                    });
-                                                }
-                                            }
-                                        }
+                                    // Drag & drop: notes are draggable, folders are drop targets.
+                                    let response = note_drag_source(
+                                        response,
+                                        &node.path,
+                                        &self.workspace_dir,
+                                    );
+                                    if node.is_dir
+                                        && note_drop_target(
+                                            ui,
+                                            &response,
+                                            &node.path,
+                                            &self.workspace_dir,
+                                            &mut action,
+                                        )
+                                        && !self.expanded.contains(&node.path)
+                                    {
+                                        self.expanded.insert(node.path.clone());
                                     }
                                     // Star icon for files
                                     if !node.is_dir {
@@ -1745,21 +1890,11 @@ impl NotesApp {
                                 });
                             }
                         });
-                    // Clear drag state if pointer released without dropping on a folder
-                    if ui.ctx().input(|i| i.pointer.any_released()) {
-                        ui.ctx().memory_mut(|mem| {
-                            mem.data.remove::<PathBuf>(egui::Id::new("dnd_source"))
-                        });
-                    }
                     let rows_empty = rows.is_empty();
                     drop(rows);
-                    if needs_refresh {
-                        self.refresh();
-                    }
                     if rows_empty && self.scan.is_none() {
                         ui.label("No files in this folder.");
                     }
-                    } // close tag filter else
                 } else {
                     let query = self.search.trim().to_lowercase();
                     if self.indexed_query.as_ref() != Some(&query) {
@@ -1792,6 +1927,8 @@ impl NotesApp {
                                         .display()
                                         .to_string(),
                                 );
+                                let response =
+                                    note_drag_source(response, path, &self.workspace_dir);
                                 if response.clicked() {
                                     action = FileAction::Open(path.clone());
                                 }
@@ -2065,6 +2202,7 @@ impl NotesApp {
                 self.rename_target = Some(path);
                 self.rename_name = stem;
             }
+            FileAction::MoveNote { source, folder } => self.move_note(&source, &folder),
             FileAction::None => {}
         }
 
@@ -2859,6 +2997,11 @@ impl NotesApp {
                         });
                 });
         }
+        // A drop target consumes the payload on release; anything left was
+        // released outside a target and must not linger as a phantom drag.
+        if egui::DragAndDrop::has_any_payload(ctx) && ctx.input(|i| i.pointer.any_released()) {
+            egui::DragAndDrop::clear_payload(ctx);
+        }
     }
 
     fn execute_palette_command(&mut self, index: usize, ctx: &egui::Context) {
@@ -3152,7 +3295,7 @@ mod tests {
         fs::write(root.join("foto.png"), "placeholder").unwrap();
         let (tx, rx) = mpsc::channel();
         scan_vault(root.clone(), Arc::new(AtomicBool::new(false)), tx, true);
-        assert!(matches!(rx.recv().unwrap(), ScanMessage::Tree(_)));
+        assert!(matches!(rx.recv().unwrap(), ScanMessage::Preview(_)));
         let tree = match rx.recv().unwrap() {
             ScanMessage::Tree(tree) => tree,
             _ => panic!("Missing tree"),
@@ -3484,6 +3627,273 @@ mod tests {
         assert!(app.starred.contains(&note));
         app.starred.remove(&note);
         assert!(app.starred.is_empty());
+    }
+
+    fn pointer_frame(
+        app: &mut NotesApp,
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1280.0, 820.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ctx| app.ui(ctx),
+        )
+    }
+
+    fn text_position(output: &egui::FullOutput, label: &str) -> egui::Pos2 {
+        output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.job.text == label => {
+                    Some(text.pos + egui::vec2(5.0, 5.0))
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("Missing UI label: {label}"))
+    }
+
+    #[test]
+    fn moves_open_note_and_saves_future_edits_at_the_new_path() {
+        let root = fixture();
+        let source = root.join("Idea.md");
+        let folder = root.join("Projects/Notes");
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(&source, "original").unwrap();
+        let mut app = test_app(root.clone());
+        app.notes.push((source.clone(), "original".into()));
+        app.open_file(&source);
+        app.editor_text = "unsaved edit".into();
+        app.move_note(&source, &folder);
+        let destination = folder.join("Idea.md");
+        assert!(!source.exists());
+        assert_eq!(fs::read_to_string(&destination).unwrap(), "unsaved edit");
+        assert_eq!(app.current_file_path.as_ref(), Some(&destination));
+        assert_eq!(app.notes[0].0, destination);
+        assert!(app.expanded.contains(&root.join("Projects")));
+        app.editor_text = "next edit".into();
+        assert!(app.save_current_file());
+        assert_eq!(fs::read_to_string(&destination).unwrap(), "next edit");
+        app.move_note(&destination, &root);
+        assert_eq!(app.current_file_path.as_ref(), Some(&source));
+        assert_eq!(fs::read_to_string(&source).unwrap(), "next edit");
+    }
+
+    #[test]
+    fn move_refuses_collisions_and_external_edits_without_losing_data() {
+        let root = fixture();
+        let source = root.join("Idea.md");
+        let folder = root.join("Notes");
+        fs::create_dir(&folder).unwrap();
+        let destination = folder.join("Idea.md");
+        fs::write(&source, "original").unwrap();
+        fs::write(&destination, "existing").unwrap();
+        let mut app = test_app(root.clone());
+        app.open_file(&source);
+        app.editor_text = "draft".into();
+        app.move_note(&source, &folder);
+        assert!(app.status.contains("already exists"));
+        assert!(move_without_overwrite(&source, &destination).is_err());
+        assert_eq!(fs::read_to_string(&destination).unwrap(), "existing");
+        assert_eq!(fs::read_to_string(&source).unwrap(), "original");
+        assert_eq!(app.editor_text, "draft");
+        let other = root.join("Other");
+        fs::create_dir(&other).unwrap();
+        fs::write(&source, "external change").unwrap();
+        app.move_note(&source, &other);
+        assert!(!other.join("Idea.md").exists());
+        assert_eq!(fs::read_to_string(&source).unwrap(), "external change");
+        assert_eq!(app.editor_text, "draft");
+        assert_eq!(app.current_file_path.as_ref(), Some(&source));
+    }
+
+    #[test]
+    fn move_rejects_outside_vault_and_handles_same_folder() {
+        let root = fixture();
+        let outside = fixture();
+        let source = root.join("Idea.md");
+        fs::write(&source, "keep").unwrap();
+        let mut app = test_app(root.clone());
+        app.move_note(&source, &outside);
+        assert!(app.status.contains("inside this vault"));
+        assert!(!outside.join("Idea.md").exists());
+        app.move_note(&source, &root);
+        assert!(app.status.contains("already in this folder"));
+        assert_eq!(fs::read_to_string(&source).unwrap(), "keep");
+    }
+
+    #[test]
+    fn clicking_a_file_row_opens_the_note() {
+        let root = fixture();
+        let note = root.join("Click me.md");
+        fs::write(&note, "hello").unwrap();
+        let mut app = test_app(root.clone());
+        app.file_tree.children = Some(vec![FileNode {
+            path: note.clone(),
+            is_dir: false,
+            children: None,
+        }]);
+        let ctx = egui::Context::default();
+        pointer_frame(&mut app, &ctx, vec![]);
+        let output = pointer_frame(&mut app, &ctx, vec![]);
+        let start = text_position(&output, "Click me.md");
+        pointer_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(start)]);
+        pointer_frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerButton {
+                pos: start,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        pointer_frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerButton {
+                pos: start,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert_eq!(app.current_file_path.as_ref(), Some(&note));
+    }
+
+    #[test]
+    fn pointer_drag_moves_notes_from_tree_and_search_and_escape_cancels() {
+        for (search, cancel) in [(false, false), (true, false), (false, true)] {
+            let root = fixture();
+            let source = root.join("Drag me.md");
+            let folder = root.join("Destination");
+            fs::create_dir(&folder).unwrap();
+            fs::write(&source, "keep me").unwrap();
+            let mut app = test_app(root.clone());
+            app.file_tree.children = Some(vec![
+                empty_tree(folder.clone()),
+                FileNode {
+                    path: source.clone(),
+                    is_dir: false,
+                    children: None,
+                },
+            ]);
+            app.notes.push((source.clone(), "keep me".into()));
+            if search {
+                app.search = "Drag".into();
+            }
+            let ctx = egui::Context::default();
+            pointer_frame(&mut app, &ctx, vec![]);
+            let output = pointer_frame(&mut app, &ctx, vec![]);
+            let start = text_position(&output, "Drag me.md");
+            pointer_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(start)]);
+            pointer_frame(
+                &mut app,
+                &ctx,
+                vec![egui::Event::PointerButton {
+                    pos: start,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+            pointer_frame(
+                &mut app,
+                &ctx,
+                vec![egui::Event::PointerMoved(start + egui::vec2(50.0, 0.0))],
+            );
+            assert!(egui::DragAndDrop::has_payload_of_type::<DraggedNote>(&ctx));
+            let output = pointer_frame(&mut app, &ctx, vec![]);
+            let target = text_position(&output, "Destination");
+            pointer_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(target)]);
+            if cancel {
+                pointer_frame(
+                    &mut app,
+                    &ctx,
+                    vec![egui::Event::Key {
+                        key: egui::Key::Escape,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                );
+            }
+            pointer_frame(
+                &mut app,
+                &ctx,
+                vec![egui::Event::PointerButton {
+                    pos: target,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+            assert_eq!(source.exists(), cancel);
+            assert_eq!(folder.join("Drag me.md").exists(), !cancel);
+            assert!(!egui::DragAndDrop::has_any_payload(&ctx));
+        }
+    }
+
+    #[test]
+    fn tree_stays_stable_during_preview_and_drag() {
+        let root = fixture();
+        let folder = root.join("Folder");
+        let mut app = test_app(root.clone());
+        app.file_tree.children = Some(vec![
+            FileNode {
+                path: folder.clone(),
+                is_dir: true,
+                children: Some(vec![FileNode {
+                    path: folder.join("A.md"),
+                    is_dir: false,
+                    children: None,
+                }]),
+            },
+            FileNode {
+                path: root.join("Dragged.md"),
+                is_dir: false,
+                children: None,
+            },
+        ]);
+        app.expanded.insert(folder);
+        let ctx = egui::Context::default();
+        // The scanning indicator joins the layout as soon as a scan is running,
+        // so establish the baseline with an active (idle) scan channel.
+        let (tx, rx) = mpsc::channel();
+        app.scan = Some(rx);
+        pointer_frame(&mut app, &ctx, vec![]);
+        let output = pointer_frame(&mut app, &ctx, vec![]);
+        let before = text_position(&output, "A.md");
+
+        // A shallow startup preview must not collapse a populated tree.
+        tx.send(ScanMessage::Preview(empty_tree(root.clone())))
+            .unwrap();
+        let loading = pointer_frame(&mut app, &ctx, vec![]);
+        assert_eq!(text_position(&loading, "A.md"), before);
+
+        // Even a full replacement is deferred while a note is being dragged.
+        tx.send(ScanMessage::Tree(empty_tree(root.clone())))
+            .unwrap();
+        egui::DragAndDrop::set_payload(
+            &ctx,
+            DraggedNote {
+                path: root.join("Dragged.md"),
+                vault: root.clone(),
+            },
+        );
+        let dragging = pointer_frame(&mut app, &ctx, vec![]);
+        assert_eq!(text_position(&dragging, "A.md"), before);
+        egui::DragAndDrop::clear_payload(&ctx);
+        pointer_frame(&mut app, &ctx, vec![]);
+        assert!(app.file_tree.children.as_ref().unwrap().is_empty());
     }
 
     #[test]
