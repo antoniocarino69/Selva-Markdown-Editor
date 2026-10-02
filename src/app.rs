@@ -16,6 +16,64 @@ enum DisplayMode {
     EditOnly,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum SearchMode {
+    FileNames,
+    NamesAndContents,
+    FoldersOnly,
+}
+
+/// egui's `Frame::side_top_panel` adds 8pt margins on each side, and the panel
+/// width machinery measures the content frame: a panel asked for `W - 16`
+/// renders exactly `W` points wide. See `exact_width` call sites.
+const PANEL_MARGIN_X: f32 = 16.0;
+
+/// Half-width of the custom panel resize grip around each panel edge.
+const RESIZE_GRAB: f32 = 4.0;
+
+fn install_fonts(ctx: &egui::Context) {
+    let installed = ctx.data(|d| d.get_temp::<bool>(egui::Id::new("selva_fonts")) == Some(true));
+    if installed {
+        return;
+    }
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "selva-bold".to_owned(),
+        egui::FontData::from_static(include_bytes!("assets/Ubuntu-Bold.ttf")),
+    );
+    fonts.families.insert(
+        egui::FontFamily::Name("selva-bold".into()),
+        vec!["selva-bold".to_owned()],
+    );
+    ctx.set_fonts(fonts);
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new("selva_fonts"), true));
+}
+
+/// Folder names render in a real bold weight (egui's `strong()` only changes
+/// the text color, not the font weight).
+fn folder_label(name: impl Into<String>) -> egui::RichText {
+    egui::RichText::new(name)
+        .font(egui::FontId::new(
+            13.5,
+            egui::FontFamily::Name("selva-bold".into()),
+        ))
+        .strong()
+}
+
+fn matching_folders(node: &FileNode, root: &Path, query: &str, out: &mut Vec<PathBuf>) {
+    if let Some(children) = &node.children {
+        for child in children {
+            if child.is_dir {
+                let relative = child.path.strip_prefix(root).unwrap_or(&child.path);
+                if relative.to_string_lossy().to_lowercase().contains(query) {
+                    out.push(child.path.clone());
+                }
+                matching_folders(child, root, query, out);
+            }
+        }
+    }
+}
+
 enum FileAction {
     None,
     Open(PathBuf),
@@ -25,6 +83,8 @@ enum FileAction {
     ShowInFileManager(PathBuf),
     Rename(PathBuf),
     MoveNote { source: PathBuf, folder: PathBuf },
+    ToggleStar(PathBuf),
+    Reveal(PathBuf),
 }
 
 struct DraggedNote {
@@ -67,7 +127,7 @@ fn note_drop_target(
         .dnd_hover_payload::<DraggedNote>()
         .filter(|note| note.vault == *vault);
     if hovering.is_none() {
-        let _ = ui.ctx().data_mut(|data| data.remove::<f64>(timer_id));
+        ui.ctx().data_mut(|data| data.remove::<f64>(timer_id));
         return false;
     }
     let now = ui.input(|input| input.time);
@@ -122,7 +182,13 @@ fn move_without_overwrite(source: &Path, destination: &Path) -> std::io::Result<
     Ok(())
 }
 
-fn file_context_menu(ui: &mut egui::Ui, path: &Path, is_dir: bool, action: &mut FileAction) {
+fn file_context_menu(
+    ui: &mut egui::Ui,
+    path: &Path,
+    is_dir: bool,
+    is_starred: bool,
+    action: &mut FileAction,
+) {
     let label = if is_dir {
         "Open folder in file explorer"
     } else {
@@ -130,6 +196,13 @@ fn file_context_menu(ui: &mut egui::Ui, path: &Path, is_dir: bool, action: &mut 
     };
     if ui.button(label).clicked() {
         *action = FileAction::ShowInFileManager(path.to_path_buf());
+        ui.close_menu();
+    }
+    if ui
+        .button(if is_starred { "Unstar" } else { "Star" })
+        .clicked()
+    {
+        *action = FileAction::ToggleStar(path.to_path_buf());
         ui.close_menu();
     }
     ui.separator();
@@ -146,12 +219,11 @@ fn file_context_menu(ui: &mut egui::Ui, path: &Path, is_dir: bool, action: &mut 
         *action = FileAction::Delete(path.to_path_buf());
         ui.close_menu();
     }
-    if !is_dir {
-        if ui.button("Rename").clicked() {
+    if !is_dir
+        && ui.button("Rename").clicked() {
             *action = FileAction::Rename(path.to_path_buf());
             ui.close_menu();
         }
-    }
 }
 
 fn file_manager_command(path: &Path) -> std::io::Result<std::process::Command> {
@@ -202,10 +274,14 @@ pub struct NotesApp {
     is_creating_note: bool,
     new_note_name: String,
     display_mode: DisplayMode,
+    search_mode: SearchMode,
+    sidebar_width: f32,
+    connections_width: f32,
+    outline_width: f32,
+    preview_width: f32,
     scan: Option<mpsc::Receiver<ScanMessage>>,
     content_requested: bool,
     content_ready: bool,
-    search_contents: bool,
     scan_cancel: Arc<AtomicBool>,
     expanded: HashSet<PathBuf>,
     backlinks: Vec<PathBuf>,
@@ -236,6 +312,9 @@ pub struct NotesApp {
     is_renaming: bool,
     rename_target: Option<PathBuf>,
     rename_name: String,
+    /// Inner edges of the visible panels, measured each frame; the resize
+    /// grips sit on these (the egui frame margins make nominal widths drift).
+    panel_edges: Vec<(&'static str, f32)>,
 }
 
 struct FileNode {
@@ -602,7 +681,7 @@ fn extract_headings(text: &str) -> Vec<(usize, String)> {
             continue;
         }
         let level = trimmed.chars().take_while(|&c| c == '#').count();
-        if level >= 1 && level <= 6 && trimmed.as_bytes().get(level) == Some(&b' ') {
+        if (1..=6).contains(&level) && trimmed.as_bytes().get(level) == Some(&b' ') {
             let heading_text = trimmed[level..].trim().to_string();
             if !heading_text.is_empty() {
                 headings.push((level, heading_text));
@@ -737,6 +816,9 @@ impl NotesApp {
             .and_then(|storage| eframe::get_value(storage, "light_theme"))
             .unwrap_or(false);
         apply_theme(&cc.egui_ctx, light_theme);
+        // Must happen before the first frame: font changes apply at the start
+        // of the next frame, and folder labels use the bold family immediately.
+        install_fonts(&cc.egui_ctx);
         let mut style = (*cc.egui_ctx.style()).clone();
         style.spacing.item_spacing = egui::vec2(6.0, 6.0);
         style.spacing.button_padding = egui::vec2(10.0, 5.0);
@@ -774,10 +856,14 @@ impl NotesApp {
             is_creating_note: false,
             new_note_name: String::new(),
             display_mode,
+            search_mode: SearchMode::FileNames,
+            sidebar_width: 250.0,
+            connections_width: 220.0,
+            outline_width: 200.0,
+            preview_width: 360.0,
             scan: None,
             content_requested: false,
             content_ready: false,
-            search_contents: false,
             scan_cancel: Arc::new(AtomicBool::new(false)),
             expanded: HashSet::new(),
             backlinks: Vec::new(),
@@ -808,10 +894,23 @@ impl NotesApp {
             is_renaming: false,
             rename_target: None,
             rename_name: String::new(),
+            panel_edges: Vec::new(),
         };
         if let Some(storage) = cc.storage {
             if let Some(saved) = eframe::get_value::<HashSet<PathBuf>>(storage, "starred") {
                 app.starred = saved;
+            }
+            for (key, width) in [
+                ("sidebar_width", &mut app.sidebar_width),
+                ("connections_width", &mut app.connections_width),
+                ("outline_width", &mut app.outline_width),
+                ("preview_width", &mut app.preview_width),
+            ] {
+                if let Some(saved) = eframe::get_value::<f32>(storage, key) {
+                    if saved.is_finite() && (64.0..=2000.0).contains(&saved) {
+                        *width = saved;
+                    }
+                }
             }
             if let Some(tabs) = eframe::get_value::<Vec<PathBuf>>(storage, "open_tabs") {
                 app.open_tabs = tabs;
@@ -1041,7 +1140,7 @@ impl NotesApp {
                         .file_tree
                         .children
                         .as_ref()
-                        .map_or(true, |children| children.is_empty())
+                        .is_none_or(|children| children.is_empty())
                     {
                         self.file_tree = tree;
                     }
@@ -1241,7 +1340,7 @@ impl NotesApp {
         {
             self.content_requested = false;
             self.content_ready = false;
-            self.search_contents = false;
+            self.search_mode = SearchMode::FileNames;
             self.show_connections = false;
             self.workspace_dir = folder;
             self.create_folder_target = None;
@@ -1387,6 +1486,10 @@ impl eframe::App for NotesApp {
         eframe::set_value(storage, "open_tabs", &self.open_tabs);
         eframe::set_value(storage, "active_tab", &self.active_tab);
         eframe::set_value(storage, "starred", &self.starred);
+        eframe::set_value(storage, "sidebar_width", &self.sidebar_width);
+        eframe::set_value(storage, "connections_width", &self.connections_width);
+        eframe::set_value(storage, "outline_width", &self.outline_width);
+        eframe::set_value(storage, "preview_width", &self.preview_width);
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -1396,7 +1499,9 @@ impl eframe::App for NotesApp {
 
 impl NotesApp {
     fn ui(&mut self, ctx: &egui::Context) {
-        if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+        install_fonts(ctx);
+        let mut panel_edges: Vec<(&'static str, f32)> = Vec::new();
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             egui::DragAndDrop::clear_payload(ctx);
         }
         if let Some(note) = egui::DragAndDrop::payload::<DraggedNote>(ctx) {
@@ -1504,12 +1609,12 @@ impl NotesApp {
                     }
                 });
             });
+        let content_y = ctx.available_rect().y_range();
         let mut action = FileAction::None;
 
         egui::SidePanel::left("vault_sidebar_v2")
-            .resizable(true)
-            .default_width(250.0)
-            .width_range(200.0..=360.0)
+            .resizable(false)
+            .exact_width(self.sidebar_width - PANEL_MARGIN_X)
             .show(ctx, |ui| {
                 ui.add_space(4.0);
                 ui.scope(|ui| {
@@ -1627,10 +1732,10 @@ impl NotesApp {
                                     egui::TextEdit::singleline(&mut self.search)
                                         .frame(false)
                                         .desired_width(width)
-                                        .hint_text(if self.search_contents {
-                                            "Search contents…"
-                                        } else {
-                                            "Search notes…"
+                                        .hint_text(match self.search_mode {
+                                            SearchMode::NamesAndContents => "Search contents…",
+                                            SearchMode::FoldersOnly => "Search folders…",
+                                            SearchMode::FileNames => "Search notes…",
                                         }),
                                 );
                                 if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::K))
@@ -1639,25 +1744,22 @@ impl NotesApp {
                                 }
                                 ui.menu_button("…", |ui| {
                                     ui.weak("SEARCH IN");
-                                    if ui
-                                        .selectable_label(!self.search_contents, "File names")
-                                        .clicked()
-                                    {
-                                        self.search_contents = false;
-                                        self.indexed_query = None;
-                                        ui.close_menu();
-                                    }
-                                    if ui
-                                        .selectable_label(
-                                            self.search_contents,
-                                            "Names and contents",
-                                        )
-                                        .clicked()
-                                    {
-                                        self.search_contents = true;
-                                        self.content_requested = true;
-                                        self.indexed_query = None;
-                                        ui.close_menu();
+                                    for (mode, label) in [
+                                        (SearchMode::FileNames, "File names"),
+                                        (SearchMode::NamesAndContents, "Names and contents"),
+                                        (SearchMode::FoldersOnly, "Folders only"),
+                                    ] {
+                                        if ui
+                                            .selectable_label(self.search_mode == mode, label)
+                                            .clicked()
+                                        {
+                                            self.search_mode = mode;
+                                            if mode == SearchMode::NamesAndContents {
+                                                self.content_requested = true;
+                                            }
+                                            self.indexed_query = None;
+                                            ui.close_menu();
+                                        }
                                     }
                                 })
                                 .response
@@ -1719,7 +1821,9 @@ impl NotesApp {
                     starred_paths.truncate(10);
                     let current = self.current_file_path.clone();
                     let mut unstar: Option<PathBuf> = None;
+                    let mut reveal: Option<PathBuf> = None;
                     for path in &starred_paths {
+                        let is_dir = path.is_dir();
                         let name = path.file_name().unwrap_or_default().to_string_lossy();
                         ui.horizontal(|ui| {
                             ui.add_space(8.0);
@@ -1732,20 +1836,33 @@ impl NotesApp {
                             if star_btn.clicked() {
                                 unstar = Some(path.clone());
                             }
-                            let label_text = name.into_owned();
+                            let label_text = if is_dir {
+                                folder_label(name.into_owned())
+                            } else {
+                                egui::RichText::new(name.into_owned()).size(13.0)
+                            };
                             let response = ui.add(egui::SelectableLabel::new(
                                 current.as_ref() == Some(path),
-                                egui::RichText::new(label_text).size(13.0),
+                                label_text,
                             ));
-                            let response =
-                                note_drag_source(response, path, &self.workspace_dir);
-                            if response.clicked() {
-                                action = FileAction::Open(path.clone());
+                            if is_dir {
+                                if response.clicked() {
+                                    reveal = Some(path.clone());
+                                }
+                            } else {
+                                let response =
+                                    note_drag_source(response, path, &self.workspace_dir);
+                                if response.clicked() {
+                                    action = FileAction::Open(path.clone());
+                                }
                             }
                         });
                     }
                     if let Some(p) = unstar {
                         self.starred.remove(&p);
+                    }
+                    if let Some(p) = reveal {
+                        action = FileAction::Reveal(p);
                     }
                     ui.add_space(2.0);
                     ui.separator();
@@ -1795,7 +1912,13 @@ impl NotesApp {
                                         action = FileAction::Open(path.clone());
                                     }
                                     response.context_menu(|ui| {
-                                        file_context_menu(ui, path, false, &mut action);
+                                        file_context_menu(
+                                            ui,
+                                            path,
+                                            false,
+                                            self.starred.contains(path),
+                                            &mut action,
+                                        );
                                     });
                                 }
                             });
@@ -1846,10 +1969,10 @@ impl NotesApp {
                                         ));
                                     }
                                     let label = name.into_owned();
-                                    let is_starred = !node.is_dir && self.starred.contains(&node.path);
+                                    let is_starred = self.starred.contains(&node.path);
                                     // Bold folder names, regular file names
                                     let label_text = if node.is_dir {
-                                        egui::RichText::new(label).strong()
+                                        folder_label(label)
                                     } else {
                                         egui::RichText::new(label)
                                     };
@@ -1877,8 +2000,8 @@ impl NotesApp {
                                     {
                                         self.expanded.insert(node.path.clone());
                                     }
-                                    // Star icon for files
-                                    if !node.is_dir {
+                                    // Star icon for files and folders
+                                    {
                                         let star_text = if is_starred {
                                             egui::RichText::new("★").size(11.0)
                                                 .color(egui::Color32::from_rgb(230, 190, 60))
@@ -1910,7 +2033,13 @@ impl NotesApp {
                                         }
                                     }
                                     response.context_menu(|ui| {
-                                        file_context_menu(ui, &node.path, node.is_dir, &mut action);
+                                        file_context_menu(
+                                            ui,
+                                            &node.path,
+                                            node.is_dir,
+                                            is_starred,
+                                            &mut action,
+                                        );
                                     });
                                 });
                             }
@@ -1922,46 +2051,88 @@ impl NotesApp {
                     }
                 } else {
                     let query = self.search.trim().to_lowercase();
-                    if self.indexed_query.as_ref() != Some(&query) {
-                        self.search_results = self
-                            .notes
-                            .iter()
-                            .filter(|(path, text)| {
-                                path.strip_prefix(&self.workspace_dir)
-                                    .unwrap_or(path)
-                                    .to_string_lossy()
-                                    .to_lowercase()
-                                    .contains(&query)
-                                    || (self.search_contents
-                                        && text.to_lowercase().contains(&query))
-                            })
-                            .map(|(p, _)| p.clone())
-                            .collect();
-                        self.indexed_query = Some(query);
-                    }
-                    ui.small(format!("{} results", self.search_results.len()));
-                    egui::ScrollArea::vertical()
-                        .id_source("search_results")
-                        .show_rows(ui, 26.0, self.search_results.len(), |ui, range| {
-                            for index in range {
-                                let path = &self.search_results[index];
-                                let response = ui.selectable_label(
-                                    self.current_file_path.as_ref() == Some(path),
-                                    path.strip_prefix(&self.workspace_dir)
+                    if self.search_mode == SearchMode::FoldersOnly {
+                        if self.indexed_query.as_ref() != Some(&query) {
+                            self.search_results.clear();
+                            matching_folders(
+                                &self.file_tree,
+                                &self.workspace_dir,
+                                &query,
+                                &mut self.search_results,
+                            );
+                            self.indexed_query = Some(query);
+                        }
+                        ui.small(format!("{} folders", self.search_results.len()));
+                        egui::ScrollArea::vertical()
+                            .id_source("search_results")
+                            .show_rows(ui, 26.0, self.search_results.len(), |ui, range| {
+                                for index in range {
+                                    let path = &self.search_results[index];
+                                    let is_starred = self.starred.contains(path);
+                                    let name = path
+                                        .strip_prefix(&self.workspace_dir)
                                         .unwrap_or(path)
                                         .display()
-                                        .to_string(),
-                                );
-                                let response =
-                                    note_drag_source(response, path, &self.workspace_dir);
-                                if response.clicked() {
-                                    action = FileAction::Open(path.clone());
+                                        .to_string();
+                                    let response =
+                                        ui.selectable_label(false, folder_label(name));
+                                    if response.clicked() {
+                                        action = FileAction::Reveal(path.clone());
+                                    }
+                                    response.context_menu(|ui| {
+                                        file_context_menu(
+                                            ui,
+                                            path,
+                                            true,
+                                            is_starred,
+                                            &mut action,
+                                        );
+                                    });
                                 }
-                                response.context_menu(|ui| {
-                                    file_context_menu(ui, path, false, &mut action);
-                                });
-                            }
-                        });
+                            });
+                    } else {
+                        if self.indexed_query.as_ref() != Some(&query) {
+                            self.search_results = self
+                                .notes
+                                .iter()
+                                .filter(|(path, text)| {
+                                    path.strip_prefix(&self.workspace_dir)
+                                        .unwrap_or(path)
+                                        .to_string_lossy()
+                                        .to_lowercase()
+                                        .contains(&query)
+                                        || (self.search_mode == SearchMode::NamesAndContents
+                                            && text.to_lowercase().contains(&query))
+                                })
+                                .map(|(p, _)| p.clone())
+                                .collect();
+                            self.indexed_query = Some(query);
+                        }
+                        ui.small(format!("{} results", self.search_results.len()));
+                        egui::ScrollArea::vertical()
+                            .id_source("search_results")
+                            .show_rows(ui, 26.0, self.search_results.len(), |ui, range| {
+                                for index in range {
+                                    let path = &self.search_results[index];
+                                    let is_starred = self.starred.contains(path);
+                                    let response = ui.selectable_label(
+                                        self.current_file_path.as_ref() == Some(path),
+                                        path.strip_prefix(&self.workspace_dir)
+                                            .unwrap_or(path)
+                                            .display()
+                                            .to_string(),
+                                    );
+                                    let response =
+                                        note_drag_source(response, path, &self.workspace_dir);
+                                    if response.clicked() {
+                                        action = FileAction::Open(path.clone());
+                                    }
+                                    response.context_menu(|ui| {
+                                        file_context_menu(ui, path, false, is_starred, &mut action);
+                                    });
+                                }
+                            });
+                    }
                 }
                 // Tags section at the bottom of sidebar
                 if !self.tags.is_empty() {
@@ -2007,6 +2178,7 @@ impl NotesApp {
                     }
                 }
             });
+        panel_edges.push(("sidebar", ctx.available_rect().min.x));
         if let Some(parent) = self.create_folder_target.clone() {
             egui::Window::new("New folder")
                 .collapsible(false)
@@ -2228,6 +2400,21 @@ impl NotesApp {
                 self.rename_name = stem;
             }
             FileAction::MoveNote { source, folder } => self.move_note(&source, &folder),
+            FileAction::ToggleStar(path) => {
+                if !self.starred.remove(&path) {
+                    self.starred.insert(path);
+                }
+            }
+            FileAction::Reveal(path) => {
+                self.search.clear();
+                self.indexed_query = None;
+                self.active_tag = None;
+                for ancestor in path.ancestors() {
+                    if ancestor.starts_with(&self.workspace_dir) {
+                        self.expanded.insert(ancestor.to_path_buf());
+                    }
+                }
+            }
             FileAction::None => {}
         }
 
@@ -2260,8 +2447,8 @@ impl NotesApp {
         if self.show_connections && is_markdown && ctx.screen_rect().width() >= 1050.0 {
             let mut navigate = None;
             egui::SidePanel::right("connections_v2")
-                .default_width(220.0)
-                .width_range(180.0..=300.0)
+                .resizable(false)
+                .exact_width(self.connections_width - PANEL_MARGIN_X)
                 .show(ctx, |ui| {
                     ui.add_space(8.0);
                     ui.label(
@@ -2335,6 +2522,7 @@ impl NotesApp {
                         ui.small("No notes link to this page.");
                     }
                 });
+            panel_edges.push(("connections", ctx.available_rect().max.x));
             if let Some(path) = navigate {
                 self.open_file(&path);
                 ctx.request_repaint();
@@ -2345,8 +2533,8 @@ impl NotesApp {
         // Outline/TOC panel on the right side
         if self.show_outline && is_markdown && ctx.screen_rect().width() >= 1050.0 {
             egui::SidePanel::right("outline_panel")
-                .default_width(200.0)
-                .width_range(160.0..=280.0)
+                .resizable(false)
+                .exact_width(self.outline_width - PANEL_MARGIN_X)
                 .show(ctx, |ui| {
                     ui.add_space(8.0);
                     ui.label(
@@ -2385,6 +2573,7 @@ impl NotesApp {
                         }
                     });
                 });
+            panel_edges.push(("outline", ctx.available_rect().max.x));
         }
 
         // Right panel for preview, ONLY in split mode
@@ -2394,9 +2583,8 @@ impl NotesApp {
 
         if show_right_preview {
             egui::SidePanel::right("preview_panel_v2")
-                .resizable(true)
-                .default_width(360.0)
-                .width_range(250.0..=500.0)
+                .resizable(false)
+                .exact_width(self.preview_width - PANEL_MARGIN_X)
                 .show(ctx, |ui| {
                     ui.add_space(4.0);
                     ui.label(
@@ -2415,6 +2603,7 @@ impl NotesApp {
                         );
                     });
                 });
+            panel_edges.push(("preview", ctx.available_rect().max.x));
         }
 
         // Central panel
@@ -2888,16 +3077,14 @@ impl NotesApp {
                             if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
                                 self.command_palette_open = false;
                             }
-                            if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
-                                if self.command_palette_selected + 1 < item_count {
+                            if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown))
+                                && self.command_palette_selected + 1 < item_count {
                                     self.command_palette_selected += 1;
                                 }
-                            }
-                            if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
-                                if self.command_palette_selected > 0 {
+                            if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp))
+                                && self.command_palette_selected > 0 {
                                     self.command_palette_selected -= 1;
                                 }
-                            }
                             if ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
                                 let sel = self.command_palette_selected;
                                 if sel < filtered.len() {
@@ -3005,16 +3192,14 @@ impl NotesApp {
                             if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
                                 self.switcher_open = false;
                             }
-                            if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
-                                if self.switcher_selected + 1 < item_count {
+                            if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown))
+                                && self.switcher_selected + 1 < item_count {
                                     self.switcher_selected += 1;
                                 }
-                            }
-                            if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
-                                if self.switcher_selected > 0 {
+                            if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp))
+                                && self.switcher_selected > 0 {
                                     self.switcher_selected -= 1;
                                 }
-                            }
                             if ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
                                 let sel = self.switcher_selected;
                                 if sel < file_items.len() {
@@ -3030,6 +3215,59 @@ impl NotesApp {
         // released outside a target and must not linger as a phantom drag.
         if egui::DragAndDrop::has_any_payload(ctx) && ctx.input(|i| i.pointer.any_released()) {
             egui::DragAndDrop::clear_payload(ctx);
+        }
+        self.panel_edges = panel_edges.clone();
+        self.resize_handles(ctx, &panel_edges, content_y);
+    }
+
+    /// App-owned resize grips on the panel edges. Registered at the very end of
+    /// the frame so they win the hit-test against any content underneath, and
+    /// driving widths held by the app (egui 0.27's built-in panel resize never
+    /// sticks: the panel state stores the content frame rect, so dragged widths
+    /// collapse back on the next frame).
+    fn resize_handles(
+        &mut self,
+        ctx: &egui::Context,
+        edges: &[(&'static str, f32)],
+        y: egui::Rangef,
+    ) {
+        let screen = ctx.screen_rect();
+        let ui = egui::Ui::new(
+            ctx.clone(),
+            egui::LayerId::background(),
+            egui::Id::new("selva_resize_handles"),
+            screen,
+            screen,
+        );
+        for (name, edge_x) in edges {
+            let rect = egui::Rect::from_x_y_ranges(
+                (edge_x - RESIZE_GRAB)..=(edge_x + RESIZE_GRAB),
+                y,
+            );
+            let response =
+                ui.interact(rect, egui::Id::new(("selva_resize", name)), egui::Sense::drag());
+            if response.hovered() || response.dragged() {
+                ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                ctx.layer_painter(egui::LayerId::background()).vline(
+                    *edge_x,
+                    y,
+                    egui::Stroke::new(2.0_f32, ctx.style().visuals.selection.stroke.color),
+                );
+            }
+            if response.dragged() {
+                if let Some(pointer) = response.interact_pointer_pos() {
+                    let delta = pointer.x - *edge_x;
+                    let width = match *name {
+                        "sidebar" => &mut self.sidebar_width,
+                        "connections" => &mut self.connections_width,
+                        "outline" => &mut self.outline_width,
+                        _ => &mut self.preview_width,
+                    };
+                    // The sidebar grows rightwards, the right panels leftwards.
+                    let sign = if *name == "sidebar" { 1.0 } else { -1.0 };
+                    *width = (*width + sign * delta).clamp(160.0, 2000.0);
+                }
+            }
         }
     }
 
@@ -3193,10 +3431,14 @@ mod tests {
             is_creating_note: false,
             new_note_name: String::new(),
             display_mode: DisplayMode::EditOnly,
+            search_mode: SearchMode::FileNames,
+            sidebar_width: 250.0,
+            connections_width: 220.0,
+            outline_width: 200.0,
+            preview_width: 360.0,
             scan: None,
             content_requested: false,
             content_ready: false,
-            search_contents: false,
             scan_cancel: Arc::new(AtomicBool::new(false)),
             expanded: HashSet::new(),
             backlinks: Vec::new(),
@@ -3227,6 +3469,7 @@ mod tests {
             is_renaming: false,
             rename_target: None,
             rename_name: String::new(),
+            panel_edges: Vec::new(),
         }
     }
 
@@ -3383,6 +3626,7 @@ mod tests {
             .insert(0, empty_tree(app.workspace_dir.join("Folder")));
         for size in [egui::vec2(800.0, 600.0), egui::vec2(1280.0, 820.0)] {
             let ctx = egui::Context::default();
+            install_fonts(&ctx);
             for _ in 0..3 {
                 let output = ctx.run(
                     egui::RawInput {
@@ -3663,6 +3907,9 @@ mod tests {
         ctx: &egui::Context,
         events: Vec<egui::Event>,
     ) -> egui::FullOutput {
+        // Fonts apply at the start of the next frame, so install them before
+        // the first `run` (NotesApp::new does the same for the real app).
+        install_fonts(ctx);
         ctx.run(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
@@ -3923,6 +4170,223 @@ mod tests {
         egui::DragAndDrop::clear_payload(&ctx);
         pointer_frame(&mut app, &ctx, vec![]);
         assert!(app.file_tree.children.as_ref().unwrap().is_empty());
+    }
+
+    fn click(app: &mut NotesApp, ctx: &egui::Context, at: egui::Pos2) {
+        pointer_frame(app, ctx, vec![egui::Event::PointerMoved(at)]);
+        pointer_frame(
+            app,
+            ctx,
+            vec![egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        pointer_frame(
+            app,
+            ctx,
+            vec![egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+    }
+
+    fn edge_of(app: &NotesApp, name: &str) -> f32 {
+        app.panel_edges
+            .iter()
+            .find(|(edge, _)| *edge == name)
+            .map(|(_, x)| *x)
+            .unwrap_or_else(|| panic!("no {name} edge"))
+    }
+
+    fn drag_edge(app: &mut NotesApp, ctx: &egui::Context, from: f32, to: f32) {
+        pointer_frame(app, ctx, vec![egui::Event::PointerMoved(egui::pos2(from, 400.0))]);
+        pointer_frame(
+            app,
+            ctx,
+            vec![egui::Event::PointerButton {
+                pos: egui::pos2(from, 400.0),
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        for step in 1..=4 {
+            pointer_frame(
+                app,
+                ctx,
+                vec![egui::Event::PointerMoved(egui::pos2(
+                    from + (to - from) * step as f32 / 4.0,
+                    400.0,
+                ))],
+            );
+        }
+        pointer_frame(
+            app,
+            ctx,
+            vec![egui::Event::PointerButton {
+                pos: egui::pos2(to, 400.0),
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+    }
+
+    #[test]
+    fn side_and_preview_panels_resize_by_dragging_their_edge() {
+        let root = fixture();
+        let note = root.join("Editor.md");
+        fs::write(&note, "# Titolo\n\nciao").unwrap();
+        let mut app = test_app(root.clone());
+        app.file_tree.children = Some(vec![FileNode {
+            path: note.clone(),
+            is_dir: false,
+            children: None,
+        }]);
+        app.notes.push((note.clone(), "# Titolo\n\nciao".into()));
+        app.open_file(&note);
+        app.content_ready = true;
+        let ctx = egui::Context::default();
+        for _ in 0..3 {
+            pointer_frame(&mut app, &ctx, vec![]);
+        }
+
+        // Sidebar: drag its right edge 60 points to the right.
+        let edge = edge_of(&app, "sidebar");
+        drag_edge(&mut app, &ctx, edge, edge + 60.0);
+        assert!(
+            (app.sidebar_width - 310.0).abs() < 1.0,
+            "sidebar width is {}",
+            app.sidebar_width
+        );
+
+        // Preview panel in split mode: drag its left edge 60 points left.
+        app.display_mode = DisplayMode::EditAndPreview;
+        for _ in 0..2 {
+            pointer_frame(&mut app, &ctx, vec![]);
+        }
+        let edge = edge_of(&app, "preview");
+        drag_edge(&mut app, &ctx, edge, edge - 60.0);
+        assert!(
+            (app.preview_width - 420.0).abs() < 1.0,
+            "preview width is {}",
+            app.preview_width
+        );
+
+        // Connections panel: drag its left edge 40 points right (shrinks).
+        app.show_connections = true;
+        for _ in 0..2 {
+            pointer_frame(&mut app, &ctx, vec![]);
+        }
+        let edge = edge_of(&app, "connections");
+        drag_edge(&mut app, &ctx, edge, edge + 40.0);
+        assert!(
+            (app.connections_width - 180.0).abs() < 1.0,
+            "connections width is {}",
+            app.connections_width
+        );
+    }
+
+    #[test]
+    fn folder_names_render_bold_and_notes_do_not() {
+        let root = fixture();
+        let folder = root.join("Progetti");
+        fs::create_dir(&folder).unwrap();
+        let note = root.join("Nota.md");
+        fs::write(&note, "ciao").unwrap();
+        let mut app = test_app(root.clone());
+        app.file_tree.children = Some(vec![
+            empty_tree(folder),
+            FileNode {
+                path: note,
+                is_dir: false,
+                children: None,
+            },
+        ]);
+        let ctx = egui::Context::default();
+        let output = pointer_frame(&mut app, &ctx, vec![]);
+        let mut folder_bold = false;
+        let mut note_bold = false;
+        for shape in &output.shapes {
+            if let egui::Shape::Text(text) = &shape.shape {
+                let font = &text.galley.job.sections[0].format.font_id;
+                let is_bold = font.family == egui::FontFamily::Name("selva-bold".into());
+                match text.galley.job.text.as_str() {
+                    "Progetti" => folder_bold = is_bold,
+                    "Nota.md" => note_bold = is_bold,
+                    _ => {}
+                }
+            }
+        }
+        assert!(folder_bold, "folder names must use the bold font");
+        assert!(!note_bold, "notes stay in the regular font");
+    }
+
+    #[test]
+    fn folder_search_lists_only_folders_and_reveals_them() {
+        let root = fixture();
+        let folder = root.join("Progetti Rossi");
+        fs::create_dir(&folder).unwrap();
+        let note = root.join("Progetti segreti.md");
+        fs::write(&note, "testo").unwrap();
+        let mut app = test_app(root.clone());
+        app.file_tree.children = Some(vec![
+            empty_tree(folder.clone()),
+            FileNode {
+                path: note.clone(),
+                is_dir: false,
+                children: None,
+            },
+        ]);
+        app.notes.push((note, "testo".into()));
+        app.search = "progetti".into();
+        app.search_mode = SearchMode::FoldersOnly;
+        let ctx = egui::Context::default();
+        let output = pointer_frame(&mut app, &ctx, vec![]);
+        let texts: Vec<String> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(t) => Some(t.galley.job.text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(texts.iter().any(|t| t == "Progetti Rossi"));
+        assert!(!texts.iter().any(|t| t == "Progetti segreti.md"));
+        assert!(texts.iter().any(|t| t == "1 folders"));
+
+        // Clicking a folder result clears the filter and reveals it in the tree.
+        let output = pointer_frame(&mut app, &ctx, vec![]);
+        let pos = text_position(&output, "Progetti Rossi");
+        click(&mut app, &ctx, pos);
+        assert!(app.search.is_empty());
+        assert!(app.expanded.contains(&folder));
+    }
+
+    #[test]
+    fn starred_folders_show_in_starred_and_reveal_in_tree() {
+        let root = fixture();
+        let folder = root.join("Archivio");
+        fs::create_dir(&folder).unwrap();
+        let mut app = test_app(root.clone());
+        app.file_tree.children = Some(vec![empty_tree(folder.clone())]);
+        app.starred.insert(folder.clone());
+        let ctx = egui::Context::default();
+        pointer_frame(&mut app, &ctx, vec![]);
+        // The STARRED section paints before the tree, so the first "Archivio"
+        // text is its entry.
+        let output = pointer_frame(&mut app, &ctx, vec![]);
+        let pos = text_position(&output, "Archivio");
+        click(&mut app, &ctx, pos);
+        assert!(app.expanded.contains(&folder));
+        assert!(app.starred.contains(&folder));
+        assert!(app.search.is_empty());
     }
 
     #[test]
