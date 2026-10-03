@@ -8,12 +8,12 @@ name = "selva"
 path = "src/main.rs"
 
 [dependencies]
-eframe = { version = "0.27", features = ["persistence"] }
+eframe = { version = "0.27", features = ["persistence", "wgpu"] }
 serde = { version = "1.0", features = ["derive"] }
 egui = "0.27"
 egui_extras = { version = "0.27", features = ["all_loaders"] }
 egui_commonmark = "0.16"
-syntect = "5.2"
+syntect = { version = "5.2", default-features = false, features = ["default-fancy"] }
 walkdir = "2.5"
 open = "5.1"
 log = "0.4"
@@ -23,6 +23,10 @@ arboard = "3.4"
 regex = "1.10"
 chrono = "0.4"
 image = "0.25"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# eframe disables wgpu's default features; explicitly compile the DX12 backend.
+wgpu = { version = "0.19", default-features = false, features = ["dx12"] }
 
 [build-dependencies]
 winres = "0.1.12"

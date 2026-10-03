@@ -1,6 +1,7 @@
 #![windows_subsystem = "windows"]
 
 mod app;
+mod editor;
 
 use eframe::egui;
 
@@ -34,7 +35,19 @@ fn window_icon(bytes: &[u8]) -> Option<egui::IconData> {
 }
 
 fn main() -> eframe::Result<()> {
-    env_logger::init(); // Log to stderr (if you run with `RUST_LOG=debug`).
+    let mut logger = env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("info"),
+    );
+    // A GUI executable has no console: retain startup diagnostics for VMs.
+    if let Some(base) = std::env::var_os("LOCALAPPDATA") {
+        let directory = std::path::PathBuf::from(base).join("Selva").join("logs");
+        if std::fs::create_dir_all(&directory).is_ok() {
+            if let Ok(file) = std::fs::File::create(directory.join("startup.log")) {
+                logger.target(env_logger::Target::Pipe(Box::new(file)));
+            }
+        }
+    }
+    logger.init();
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("Selva — Notes and connections")
@@ -46,20 +59,35 @@ fn main() -> eframe::Result<()> {
         log::warn!("Could not decode the window icon; using the default icon");
     }
 
-    let options = eframe::NativeOptions {
+    let mut options = eframe::NativeOptions {
         viewport,
         ..Default::default()
     };
 
-    eframe::run_native(
+    #[cfg(target_os = "windows")]
+    {
+        // DX12 also enumerates Windows' software adapter on Hyper-V/RDP.
+        options.renderer = eframe::Renderer::Wgpu;
+        options.wgpu_options.supported_backends = eframe::wgpu::Backends::DX12;
+    }
+
+    let result = eframe::run_native(
         "Selva — Note e connessioni",
         options,
         Box::new(|cc| {
+            if let Some(state) = &cc.wgpu_render_state {
+                let adapter = state.adapter.get_info();
+                log::info!("Graphics adapter: {} ({:?}, {:?})", adapter.name, adapter.backend, adapter.device_type);
+            }
             // Optional: configure egui to look nicer
             egui_extras::install_image_loaders(&cc.egui_ctx);
             Box::new(app::NotesApp::new(cc))
         }),
-    )
+    );
+    if let Err(error) = &result {
+        log::error!("Selva startup failed: {error}");
+    }
+    result
 }
 
 #[cfg(test)]

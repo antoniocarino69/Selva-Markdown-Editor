@@ -1,5 +1,7 @@
 use eframe::egui;
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
+
+use crate::editor;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -14,6 +16,8 @@ enum DisplayMode {
     ViewOnly,
     EditAndPreview,
     EditOnly,
+    /// Block-based WYSIWYG editing (see `docs/WYSIWYG_PLAN.md`).
+    Wysiwyg,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -337,6 +341,8 @@ pub struct NotesApp {
     palette_files: Vec<PathBuf>,
     /// External file awaiting user confirmation before launching it.
     pending_external: Option<PathBuf>,
+    /// The WYSIWYG block editor (active in `DisplayMode::Wysiwyg`).
+    wysiwyg: editor::EditorWidget,
 }
 
 struct FileNode {
@@ -921,6 +927,7 @@ impl NotesApp {
             panel_edges: Vec::new(),
             palette_files: Vec::new(),
             pending_external: None,
+            wysiwyg: editor::EditorWidget::new(egui::Id::new("selva_wysiwyg")),
         };
         if let Some(storage) = cc.storage {
             if let Some(saved) = eframe::get_value::<HashSet<PathBuf>>(storage, "starred") {
@@ -1012,6 +1019,7 @@ impl NotesApp {
                 self.current_file_path = Some(path.to_path_buf());
                 self.saved_text = content.clone();
                 self.editor_text = content;
+                self.wysiwyg.load(&self.editor_text);
                 self.focus_editor = true;
                 self.last_edit = None;
                 self.refresh_backlinks();
@@ -1346,16 +1354,17 @@ impl NotesApp {
         }
     }
 
+    /// Save a pasted image under `_assets` and return the embed to insert at
+    /// the caller's cursor (TextEdit or WYSIWYG widget).
     fn save_pasted_image(
         &mut self,
         img_data: arboard::ImageData,
         filename: &str,
-        output: &egui::text_edit::TextEditOutput,
-    ) -> bool {
+    ) -> Option<String> {
         let target_dir = self.workspace_dir.join("_assets");
         if let Err(e) = fs::create_dir_all(&target_dir) {
             self.status = format!("Could not save pasted image: {e}");
-            return false;
+            return None;
         }
         // Timestamps have one-second granularity: never overwrite an earlier
         // paste, and insert a link to the name actually used on disk.
@@ -1375,17 +1384,15 @@ impl NotesApp {
             img_data.bytes.into_owned(),
         ) else {
             self.status = "Could not decode pasted image.".into();
-            return false;
+            return None;
         };
         if img_buffer.save(&file_path).is_err() {
             self.status = "Could not save pasted image.".into();
-            return false;
+            return None;
         }
         let saved_name = file_path.file_name().unwrap_or_default().to_string_lossy().into_owned();
-        let insert_text = format!("![[{saved_name}]]");
-        self.insert_at_cursor(&insert_text, output);
-        self.image_cache.insert(saved_name, file_path);
-        true
+        self.image_cache.insert(saved_name.clone(), file_path);
+        Some(format!("![[{saved_name}]]"))
     }
 
     fn choose_vault(&mut self) {
@@ -1638,6 +1645,10 @@ impl NotesApp {
                 }
             }
         }
+        // Ctrl+Shift+V: cycle display modes (Write/Read/Split/Live)
+        if ctx.input(|i| i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::V)) {
+            self.cycle_display_mode();
+        }
         // Ctrl+Shift+O: toggle outline panel
         if ctx.input(|i| i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::O)) {
             self.show_outline = !self.show_outline;
@@ -1808,6 +1819,9 @@ impl NotesApp {
                                         }),
                                 );
                                 if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::K))
+                                    // In Live mode Ctrl+K inserts a link in
+                                    // the editor instead of focusing search.
+                                    && self.display_mode != DisplayMode::Wysiwyg
                                 {
                                     search.request_focus();
                                 }
@@ -1844,11 +1858,12 @@ impl NotesApp {
                             ui.spacing_mut().item_spacing.x = 1.0;
                             ui.horizontal(|ui| {
                                 let wide = ctx.screen_rect().width() >= 1050.0;
-                                let count = if wide { 3.0 } else { 2.0 };
+                                let count = if wide { 4.0 } else { 3.0 };
                                 let width = (ui.available_width() - (count - 1.0) * 1.0) / count;
                                 for (mode, label) in [
                                     (DisplayMode::EditOnly, "Write"),
                                     (DisplayMode::ViewOnly, "Read"),
+                                    (DisplayMode::Wysiwyg, "Live"),
                                     (DisplayMode::EditAndPreview, "Split"),
                                 ] {
                                     if label == "Split" && !wide {
@@ -2920,6 +2935,66 @@ impl NotesApp {
                             &processed_text,
                         );
                     });
+                } else if is_markdown && self.display_mode == DisplayMode::Wysiwyg {
+                    // WYSIWYG mode: the block editor owns the text. It writes
+                    // back into `editor_text`, so save/backlinks/tags/outline
+                    // keep working unchanged.
+                    let mut pending_image: Option<(arboard::ImageData, String)> = None;
+                    {
+                        let has_paste = ctx.input(|i| {
+                            i.events
+                                .iter()
+                                .any(|e| matches!(e, egui::Event::Paste(_)))
+                        });
+                        if has_paste {
+                            if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                                if let Ok(img_data) = clipboard.get_image() {
+                                    let filename = format!(
+                                        "Pasted image {}.png",
+                                        chrono::Local::now().format("%Y%m%d%H%M%S")
+                                    );
+                                    pending_image = Some((img_data, filename));
+                                    // Remove Paste event so the widget doesn't
+                                    // also insert the clipboard text.
+                                    ctx.input_mut(|i| {
+                                        i.events
+                                            .retain(|e| !matches!(e, egui::Event::Paste(_)));
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    if self.wysiwyg.text() != self.editor_text {
+                        // External buffer change (note switch, mode switch,
+                        // wiki-link rewrite): reload the block model.
+                        self.wysiwyg.load(&self.editor_text);
+                    }
+                    if self.focus_editor
+                        && !self.is_creating_note
+                        && self.create_folder_target.is_none()
+                    {
+                        self.wysiwyg.request_focus();
+                        self.focus_editor = false;
+                    }
+                    let opts = editor::EditorOpts {
+                        light: self.light_theme,
+                        image_cache: &self.image_cache,
+                        workspace: &self.workspace_dir,
+                    };
+                    let response = self.wysiwyg.show(ui, &opts);
+                    if response.changed {
+                        self.editor_text = self.wysiwyg.text();
+                        self.last_edit = Some(Instant::now());
+                        ctx.request_repaint_after(Duration::from_millis(700));
+                    }
+                    if let Some((img_data, filename)) = pending_image {
+                        if let Some(text) = self.save_pasted_image(img_data, &filename) {
+                            self.wysiwyg.insert_at_cursor(&text);
+                            self.editor_text = self.wysiwyg.text();
+                            self.last_edit = Some(Instant::now());
+                            ctx.request_repaint_after(Duration::from_millis(700));
+                        }
+                    }
                 } else {
                     // Editor
 
@@ -2990,11 +3065,10 @@ impl NotesApp {
                                             "Pasted image {}.png",
                                             chrono::Local::now().format("%Y%m%d%H%M%S")
                                         );
-                                        if self.save_pasted_image(
-                                            img_data,
-                                            &filename,
-                                            &output,
-                                        ) {
+                                        if let Some(text) =
+                                            self.save_pasted_image(img_data, &filename)
+                                        {
+                                            self.insert_at_cursor(&text, &output);
                                             self.last_edit = Some(Instant::now());
                                             ctx.request_repaint_after(
                                                 Duration::from_millis(700),
@@ -3016,7 +3090,10 @@ impl NotesApp {
                     }
                     let mut pasted_image = false;
                     if let Some((img_data, filename)) = pending_image {
-                        pasted_image = self.save_pasted_image(img_data, &filename, &output);
+                        if let Some(text) = self.save_pasted_image(img_data, &filename) {
+                            self.insert_at_cursor(&text, &output);
+                            pasted_image = true;
+                        }
                     }
 
                     if output.response.changed() || pasted_image {
@@ -3079,8 +3156,9 @@ impl NotesApp {
                 (9, "➡️", "Next Tab", "Ctrl+Tab"),
                 (10, "⬅️", "Previous Tab", "Ctrl+Shift+Tab"),
                 (11, "⭐", "Star Note", "Ctrl+D"),
+                (12, "✒️", "WYSIWYG (Live) mode", "Ctrl+Shift+V"),
             ];
-            // Add file entries starting at index 12
+            // Add file entries starting at index 13
             let file_entries: Vec<(PathBuf, String)> = self
                 .notes
                 .iter()
@@ -3116,7 +3194,7 @@ impl NotesApp {
                         .parent()
                         .map(|d| d.to_string_lossy().into_owned())
                         .unwrap_or_default();
-                    (12 + i, name.clone(), rel)
+                    (13 + i, name.clone(), rel)
                 })
                 .collect();
             // Filter commands
@@ -3401,6 +3479,16 @@ impl NotesApp {
         }
     }
 
+    /// Write → Read → Split → Live → Write
+    fn cycle_display_mode(&mut self) {
+        self.display_mode = match self.display_mode {
+            DisplayMode::EditOnly => DisplayMode::ViewOnly,
+            DisplayMode::ViewOnly => DisplayMode::EditAndPreview,
+            DisplayMode::EditAndPreview => DisplayMode::Wysiwyg,
+            DisplayMode::Wysiwyg => DisplayMode::EditOnly,
+        };
+    }
+
     fn execute_palette_command(&mut self, index: usize, ctx: &egui::Context) {
         match index {
             0 => {
@@ -3422,13 +3510,9 @@ impl NotesApp {
                 // Open Vault
                 self.choose_vault();
             }
-            4 => {
-                // Toggle Split View
-                self.display_mode = match self.display_mode {
-                    DisplayMode::EditOnly => DisplayMode::ViewOnly,
-                    DisplayMode::ViewOnly => DisplayMode::EditAndPreview,
-                    DisplayMode::EditAndPreview => DisplayMode::EditOnly,
-                };
+            4 | 12 => {
+                // Cycle view modes (Write → Read → Split → Live)
+                self.cycle_display_mode();
             }
             5 => {
                 // Open Daily Note
@@ -3490,10 +3574,10 @@ impl NotesApp {
                 }
             }
             _ => {
-                // File item (index >= 12): position in the palette's own
-                // filtered list, not in the full notes vector.
+                // File item (index >= 13): position in the palette's own
+                // filtered list, not into the full notes vector.
                 let path = index
-                    .checked_sub(12)
+                    .checked_sub(13)
                     .and_then(|i| self.palette_files.get(i))
                     .cloned();
                 if let Some(path) = path {
@@ -3605,6 +3689,7 @@ mod tests {
             panel_edges: Vec::new(),
             palette_files: Vec::new(),
             pending_external: None,
+            wysiwyg: editor::EditorWidget::new(egui::Id::new("selva_wysiwyg_test")),
         }
     }
 
@@ -4572,7 +4657,7 @@ mod tests {
         let ctx = egui::Context::default();
         pointer_frame(&mut app, &ctx, vec![]);
         assert_eq!(app.palette_files, vec![c.clone()]);
-        app.execute_palette_command(12, &ctx);
+        app.execute_palette_command(13, &ctx);
         assert_eq!(app.current_file_path.as_ref(), Some(&c));
     }
 

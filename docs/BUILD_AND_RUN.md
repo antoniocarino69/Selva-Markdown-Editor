@@ -1,28 +1,24 @@
 # Selva Build & Run Instructions
 
-## On machines WITH a GPU (normal PCs, laptops):
-```
+```powershell
 cargo build --release
-./target/release/selva.exe
+.\target\release\selva.exe
 ```
 
-## On machines WITHOUT GPU (VMs, Hyper-V, headless):
-Mesa3D DLLs must be placed next to the executable. Copy from `mesa3d/x64/` to `target/release/`:
-- opengl32.dll
-- libglapi.dll
-- libgallium_wgl.dll
-- libEGL.dll
+## Windows, Hyper-V and Remote Desktop
 
-Then set env vars before running:
-```
-set LIBGL_ALWAYS_SOFTWARE=1
-set MESA_GL_VERSION_OVERRIDE=2.1
-selva.exe
-```
+Windows builds use eframe's wgpu renderer with DirectX 12. Windows' software
+adapter (Microsoft Basic Render Driver / WARP) can be selected automatically
+when there is no suitable physical GPU. No Mesa DLLs or OpenGL environment
+variables are needed for this path. Software rendering uses the CPU.
 
-## Alternative: wgpu backend (DirectX/Vulkan instead of OpenGL)
-Change Cargo.toml:
-```toml
-eframe = { version = "0.27", default-features = false, features = ["persistence", "wgpu", "default_fonts"] }
-```
-This uses DirectX on Windows — works on VMs with DirectX support.
+Launch `target/release/selva.exe` normally. Startup and graphics diagnostics are
+written to `%LOCALAPPDATA%\Selva\logs\startup.log`, replaced on each launch.
+Set `RUST_LOG=debug` before launching for more detail. Other platforms retain
+eframe's default renderer.
+
+Validated on 2026-10-02 in this Windows Hyper-V VM: the release window renders
+and responds, and the startup log identifies `Microsoft Basic Render Driver
+(Dx12, Cpu)`. Both the Hyper-V Video and Remote Display adapters are installed.
+
+Reference: [Microsoft WARP documentation](https://learn.microsoft.com/en-us/windows/win32/direct3darticles/directx-warp).
